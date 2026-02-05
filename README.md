@@ -174,10 +174,40 @@ The source table should contain Primanota booking records. Column names are matc
 
 ### Alternative Column Names
 
-The extension also recognizes these alternative column names:
-- `umsatz` → maps to `curEingabeBetrag`
-- `umsatz_mit_vorzeichen` → maps to `curBasisBetrag`
-- `strbuchtext` → maps to `strBuchText`
+The extension recognizes many alternative column names (case-insensitive):
+
+| Alternative Names | Maps To |
+|------------------|---------|
+| `konto`, `kontonr`, `konto_nr`, `account` | `decKontoNr` |
+| `gegenkonto`, `gegenkontonr`, `gegenkonto_nr` | `decGegenkontoNr` |
+| `eakonto`, `ea_konto`, `eakontonr` | `decEaKontoNr` |
+| `umsatz`, `betrag`, `amount` | `curEingabeBetrag` |
+| `umsatz_mit_vorzeichen`, `basisbetrag` | `curBasisBetrag` |
+| `sh`, `soll_haben`, `sollhaben` | `ysnSoll` |
+| `buchungstext`, `buchtext`, `text` | `strBuchText` |
+| `belegdatum`, `datum`, `date` | `dtmBelegDatum` |
+| `beleg1`, `beleg_1`, `belegnr` | `strBeleg1` |
+| `beleg2`, `beleg_2` | `strBeleg2` |
+
+### Soll/Haben (sh) Column Parsing
+
+The `sh` column (or `ysnSoll`) accepts multiple formats:
+
+| Input Value | Interpreted As |
+|-------------|----------------|
+| `S`, `Soll`, `1`, `true`, `D`, `Debit` | Soll (Debit) = **true** |
+| `H`, `Haben`, `0`, `false`, `C`, `Credit` | Haben (Credit) = **false** |
+
+Example:
+```sql
+-- All of these are equivalent for ysnSoll
+SELECT 'S' AS sh;      -- Soll
+SELECT 'Soll' AS sh;   -- Soll
+SELECT 1 AS ysnSoll;   -- Soll
+SELECT 'H' AS sh;      -- Haben
+SELECT 'Haben' AS sh;  -- Haben
+SELECT 0 AS ysnSoll;   -- Haben
+```
 
 ### Example Source Data
 
