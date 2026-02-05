@@ -4,6 +4,11 @@ cmake_minimum_required(VERSION 3.15...3.28)
 set(TARGET_NAME wz)
 
 project(${TARGET_NAME})
+
+# Require C++17
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include_directories(src/include)
 # Include yyjson for JSON parsing
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson/include)

@@ -760,7 +760,9 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         // =========================================================================
 
         string vorlauf_id = GenerateUUID();
-        auto [date_from, date_to] = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+        pair<string, string> date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+        string date_from = date_range.first;
+        string date_to = date_range.second;
 
         if (date_from.empty()) {
             // Default to current month

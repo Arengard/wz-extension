@@ -45,8 +45,13 @@ static pair<int, int> ExtractMonthYear(const string &date_str) {
 // ============================================================================
 
 string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
-    auto [month_from, year_from] = ExtractMonthYear(date_from);
-    auto [month_to, year_to] = ExtractMonthYear(date_to);
+    pair<int, int> from_result = ExtractMonthYear(date_from);
+    int month_from = from_result.first;
+    int year_from = from_result.second;
+
+    pair<int, int> to_result = ExtractMonthYear(date_to);
+    int month_to = to_result.first;
+    int year_to = to_result.second;
 
     char buffer[128];
     snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d-%02d/%d",
