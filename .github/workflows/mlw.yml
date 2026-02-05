@@ -197,11 +197,43 @@ jobs:
           name: wz-windows-amd64
           path: dist/windows
 
-      - name: Rename artifacts for release
+      - name: Prepare extension files for release
         run: |
-          mv dist/macos/wz.duckdb_extension dist/wz-macos.duckdb_extension
-          mv dist/linux/wz.duckdb_extension dist/wz-linux-amd64.duckdb_extension
-          mv dist/windows/wz.duckdb_extension dist/wz-windows-amd64.duckdb_extension
+          # Create gzipped versions with platform-specific names for DuckDB repo structure
+          # DuckDB looks for: <platform>/wz.duckdb_extension.gz
+          # Since GitHub releases flatten directories, we'll create both formats
+          
+          # Create platform directories (for potential future use with GitHub Pages)
+          mkdir -p repo/v1.4.4/osx_arm64
+          mkdir -p repo/v1.4.4/osx_amd64  
+          mkdir -p repo/v1.4.4/linux_amd64
+          mkdir -p repo/v1.4.4/linux_amd64_gcc4
+          mkdir -p repo/v1.4.4/windows_amd64
+          
+          # macOS
+          gzip -c dist/macos/wz.duckdb_extension > repo/v1.4.4/osx_arm64/wz.duckdb_extension.gz
+          cp repo/v1.4.4/osx_arm64/wz.duckdb_extension.gz repo/v1.4.4/osx_amd64/wz.duckdb_extension.gz
+          
+          # Linux
+          gzip -c dist/linux/wz.duckdb_extension > repo/v1.4.4/linux_amd64/wz.duckdb_extension.gz
+          cp repo/v1.4.4/linux_amd64/wz.duckdb_extension.gz repo/v1.4.4/linux_amd64_gcc4/wz.duckdb_extension.gz
+          
+          # Windows
+          gzip -c dist/windows/wz.duckdb_extension > repo/v1.4.4/windows_amd64/wz.duckdb_extension.gz
+          
+          # Create friendly named files for direct download (uncompressed)
+          cp dist/macos/wz.duckdb_extension dist/wz-macos.duckdb_extension
+          cp dist/linux/wz.duckdb_extension dist/wz-linux-amd64.duckdb_extension
+          cp dist/windows/wz.duckdb_extension dist/wz-windows-amd64.duckdb_extension
+          
+          # Create flat gzipped files with platform prefix for GitHub release
+          # These can be used if someone sets up a redirect/proxy
+          gzip -c dist/macos/wz.duckdb_extension > dist/osx_arm64-wz.duckdb_extension.gz
+          gzip -c dist/linux/wz.duckdb_extension > dist/linux_amd64-wz.duckdb_extension.gz
+          gzip -c dist/windows/wz.duckdb_extension > dist/windows_amd64-wz.duckdb_extension.gz
+          
+          echo "Files prepared for release:"
+          ls -la dist/
 
       - name: Delete existing latest release
         uses: dev-drprasad/delete-tag-and-release@v1.1
@@ -219,17 +251,27 @@ jobs:
           body: |
             Automated build from commit ${{ github.sha }}
             Branch: ${{ github.ref_name }}
+            DuckDB Version: v1.4.4
             
-            ## Installation
+            ## Installation (Local File - Recommended)
+            Download the extension for your platform and run:
             ```sql
-            -- Download the extension for your platform and run:
-            INSTALL './wz-<platform>.duckdb_extension';
+            SET allow_unsigned_extensions = true;
+            INSTALL './wz-windows-amd64.duckdb_extension';  -- or wz-linux-amd64, wz-macos
             LOAD wz;
+            ```
+            
+            ## Quick Test
+            ```sql
+            SELECT * FROM into_wz_status();
             ```
           files: |
             dist/wz-macos.duckdb_extension
             dist/wz-linux-amd64.duckdb_extension
             dist/wz-windows-amd64.duckdb_extension
+            dist/osx_arm64-wz.duckdb_extension.gz
+            dist/linux_amd64-wz.duckdb_extension.gz
+            dist/windows_amd64-wz.duckdb_extension.gz
           draft: false
           prerelease: false
           make_latest: true
