@@ -812,8 +812,8 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         auto vorlauf_start = std::chrono::high_resolution_clock::now();
 
         // Create a single connection for the entire transaction
-        auto &db = DatabaseInstance::GetDatabase(context);
-        Connection txn_conn(db);
+        auto &txn_db = DatabaseInstance::GetDatabase(context);
+        Connection txn_conn(txn_db);
 
         // Begin transaction
         if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
