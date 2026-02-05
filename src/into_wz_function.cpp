@@ -287,8 +287,8 @@ static vector<string> CheckDuplicates(ClientContext &context,
             in_clause += "'" + EscapeSqlString(primanota_ids[i]) + "'";
         }
 
-        string sql = "SELECT CAST(guiPrimanotaID AS VARCHAR(36)) FROM tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
-        string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
+        string sql = "SELECT CAST(guiPrimanotaID AS VARCHAR(36)) AS id FROM tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
+        string query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "$$)";
 
         auto result = conn.Query(query);
         if (!result->HasError()) {
@@ -515,13 +515,13 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
 }
 
 // ============================================================================
-// Helper: Execute SQL via mssql_scan (for queries that return data)
+// Helper: Execute SQL via mssql_query (for queries that return data)
 // ============================================================================
 
 static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &context,
                                                               const string &secret_name,
                                                               const string &sql) {
-    string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
+    string query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "$$)";
     auto result = context.Query(query, false);
     if (result->HasError()) {
         return nullptr;
@@ -542,14 +542,23 @@ static bool ExecuteMssqlStatement(ClientContext &context,
     auto &db = DatabaseInstance::GetDatabase(context);
     Connection conn(db);
 
-    // Use mssql_scan with a wrapper that returns success indicator
-    string wrapped_sql = sql + "; SELECT 1 AS success";
-    string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + wrapped_sql + "$$)";
+    // Use mssql_execute for statements (INSERT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK)
+    // mssql_execute(secret, sql) returns affected rows
+    string query = "CALL mssql_execute('" + secret_name + "', $$" + sql + "$$)";
 
     auto result = conn.Query(query);
     if (result->HasError()) {
+        // Try alternative: use ATTACH + direct execution
         error_message = result->GetError();
-        return false;
+
+        // Fallback: try mssql_query which might work for some statements
+        string alt_query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "; SELECT 1 AS ok$$)";
+        auto alt_result = conn.Query(alt_query);
+        if (alt_result->HasError()) {
+            error_message = alt_result->GetError();
+            return false;
+        }
+        return true;
     }
     return true;
 }
