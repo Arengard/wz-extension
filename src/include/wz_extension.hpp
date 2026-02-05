@@ -2,17 +2,19 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/extension.hpp"
+#include "duckdb/main/extension_entries.hpp"
 
 namespace duckdb {
 
 // Forward declarations
 class WzExtension : public Extension {
 public:
-    void Load(DuckDB &db) override;
+    void Load(ExtensionLoader &loader) override;
     std::string Name() override;
+    std::string Version() const override;
 };
 
 // ============================================================================

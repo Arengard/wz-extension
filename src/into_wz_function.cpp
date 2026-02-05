@@ -1,11 +1,13 @@
 #include "wz_extension.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/connection.hpp"
 #include "yyjson.hpp"
 #include <chrono>
 #include <sstream>
@@ -22,21 +24,77 @@ struct ColumnMapping {
     bool required;
 };
 
+// Note: These mappings define alternative column names
+// The actual column lookup happens in BuildPrimanotaInsertSQL with fallback logic
 static const vector<ColumnMapping> PRIMANOTA_COLUMN_MAPPINGS = {
+    // Primary column names
     {"guiPrimanotaID", "guiPrimanotaID", true},
     {"dtmBelegDatum", "dtmBelegDatum", true},
     {"decKontoNr", "decKontoNr", true},
     {"decGegenkontoNr", "decGegenkontoNr", true},
+    {"decEaKontoNr", "decEaKontoNr", false},
     {"ysnSoll", "ysnSoll", true},
     {"curEingabeBetrag", "curEingabeBetrag", true},
     {"curBasisBetrag", "curBasisBetrag", false},
     {"strBeleg1", "strBeleg1", false},
     {"strBeleg2", "strBeleg2", false},
     {"strBuchText", "strBuchText", false},
-    {"umsatz", "curEingabeBetrag", false},  // Alternative name
-    {"umsatz_mit_vorzeichen", "curBasisBetrag", false},  // Alternative name
-    {"strbuchtext", "strBuchText", false},  // Case variation
+    // Alternative names (common in source data)
+    {"konto", "decKontoNr", false},              // konto -> decKontoNr
+    {"gegenkonto", "decGegenkontoNr", false},    // gegenkonto -> decGegenkontoNr
+    {"eakonto", "decEaKontoNr", false},          // eakonto -> decEaKontoNr
+    {"ea_konto", "decEaKontoNr", false},         // ea_konto -> decEaKontoNr
+    {"umsatz", "curEingabeBetrag", false},       // umsatz -> curEingabeBetrag
+    {"betrag", "curEingabeBetrag", false},       // betrag -> curEingabeBetrag
+    {"umsatz_mit_vorzeichen", "curBasisBetrag", false},
+    {"sh", "ysnSoll", false},                    // sh (Soll/Haben) -> ysnSoll
+    {"soll_haben", "ysnSoll", false},            // soll_haben -> ysnSoll
+    {"strbuchtext", "strBuchText", false},
+    {"buchungstext", "strBuchText", false},
+    {"text", "strBuchText", false},
+    {"beleg1", "strBeleg1", false},
+    {"beleg2", "strBeleg2", false},
+    {"belegdatum", "dtmBelegDatum", false},
+    {"datum", "dtmBelegDatum", false},
 };
+
+// ============================================================================
+// Helper: Parse Soll/Haben string to boolean
+// Returns true for Soll (S), false for Haben (H)
+// ============================================================================
+
+static bool ParseSollHaben(const Value &val) {
+    if (val.IsNull()) {
+        return false;  // Default to Haben (credit)
+    }
+
+    // If it's already a boolean, return it directly
+    if (val.type().id() == LogicalTypeId::BOOLEAN) {
+        return val.GetValue<bool>();
+    }
+
+    // If it's a number (0 or 1)
+    if (val.type().id() == LogicalTypeId::INTEGER ||
+        val.type().id() == LogicalTypeId::BIGINT ||
+        val.type().id() == LogicalTypeId::TINYINT ||
+        val.type().id() == LogicalTypeId::SMALLINT) {
+        return val.GetValue<int64_t>() != 0;
+    }
+
+    // Parse string values
+    string str = val.ToString();
+    // Convert to uppercase for comparison
+    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+
+    // Soll (Debit) = true
+    if (str == "S" || str == "SOLL" || str == "1" || str == "TRUE" || str == "DEBIT" || str == "D") {
+        return true;
+    }
+
+    // Haben (Credit) = false
+    // "H", "HABEN", "0", "FALSE", "CREDIT", "C", or anything else
+    return false;
+}
 
 // ============================================================================
 // Bind data for into_wz function
@@ -325,26 +383,60 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
 
     string timestamp = GetCurrentTimestamp();
 
-    // Find column indices
+    // Helper lambda to find column with fallback names
+    auto findColumnWithFallbacks = [&columns](std::initializer_list<const char*> names) -> idx_t {
+        for (const char* name : names) {
+            idx_t idx = FindColumnIndex(columns, name);
+            if (idx != DConstants::INVALID_INDEX) {
+                return idx;
+            }
+        }
+        return DConstants::INVALID_INDEX;
+    };
+
+    // Find column indices with fallback alternative names
     idx_t col_primanota_id = FindColumnIndex(columns, "guiPrimanotaID");
-    idx_t col_beleg_datum = FindColumnIndex(columns, "dtmBelegDatum");
-    idx_t col_konto_nr = FindColumnIndex(columns, "decKontoNr");
-    idx_t col_gegenkonto_nr = FindColumnIndex(columns, "decGegenkontoNr");
-    idx_t col_ysn_soll = FindColumnIndex(columns, "ysnSoll");
-    idx_t col_eingabe_betrag = FindColumnIndex(columns, "curEingabeBetrag");
-    if (col_eingabe_betrag == DConstants::INVALID_INDEX) {
-        col_eingabe_betrag = FindColumnIndex(columns, "umsatz");
-    }
-    idx_t col_basis_betrag = FindColumnIndex(columns, "curBasisBetrag");
-    if (col_basis_betrag == DConstants::INVALID_INDEX) {
-        col_basis_betrag = FindColumnIndex(columns, "umsatz_mit_vorzeichen");
-    }
-    idx_t col_beleg1 = FindColumnIndex(columns, "strBeleg1");
-    idx_t col_beleg2 = FindColumnIndex(columns, "strBeleg2");
-    idx_t col_buch_text = FindColumnIndex(columns, "strBuchText");
-    if (col_buch_text == DConstants::INVALID_INDEX) {
-        col_buch_text = FindColumnIndex(columns, "strbuchtext");
-    }
+
+    idx_t col_beleg_datum = findColumnWithFallbacks({
+        "dtmBelegDatum", "belegdatum", "datum", "date"
+    });
+
+    idx_t col_konto_nr = findColumnWithFallbacks({
+        "decKontoNr", "konto", "kontonr", "konto_nr", "account"
+    });
+
+    idx_t col_gegenkonto_nr = findColumnWithFallbacks({
+        "decGegenkontoNr", "gegenkonto", "gegenkontonr", "gegenkonto_nr", "counter_account"
+    });
+
+    idx_t col_ea_konto_nr = findColumnWithFallbacks({
+        "decEaKontoNr", "eakonto", "ea_konto", "eakontonr", "ea_konto_nr"
+    });
+
+    // ysnSoll can come from ysnSoll (boolean) or sh (Soll/Haben string)
+    idx_t col_ysn_soll = findColumnWithFallbacks({
+        "ysnSoll", "ysnsoll", "soll", "sh", "soll_haben", "sollhaben"
+    });
+
+    idx_t col_eingabe_betrag = findColumnWithFallbacks({
+        "curEingabeBetrag", "umsatz", "betrag", "amount", "eingabebetrag"
+    });
+
+    idx_t col_basis_betrag = findColumnWithFallbacks({
+        "curBasisBetrag", "umsatz_mit_vorzeichen", "basisbetrag", "basis_betrag"
+    });
+
+    idx_t col_beleg1 = findColumnWithFallbacks({
+        "strBeleg1", "beleg1", "beleg_1", "belegnr", "belegnummer"
+    });
+
+    idx_t col_beleg2 = findColumnWithFallbacks({
+        "strBeleg2", "beleg2", "beleg_2"
+    });
+
+    idx_t col_buch_text = findColumnWithFallbacks({
+        "strBuchText", "strbuchtext", "buchungstext", "buchtext", "text", "description"
+    });
 
     std::ostringstream sql;
     sql << "INSERT INTO tblPrimanota (";
@@ -385,7 +477,9 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
 
         Value konto_val = getValue(col_konto_nr);
         Value gegenkonto_val = getValue(col_gegenkonto_nr);
+        Value ea_konto_val = getValue(col_ea_konto_nr);
         Value ysn_soll_val = getValue(col_ysn_soll);
+        bool is_soll = ParseSollHaben(ysn_soll_val);  // Parse Soll/Haben string
         Value eingabe_betrag_val = getValue(col_eingabe_betrag);
         Value basis_betrag_val = getValue(col_basis_betrag);
         Value beleg1_val = getValue(col_beleg1);
@@ -411,10 +505,10 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
         sql << "NULL, ";  // lngBu
         sql << FormatSqlValue(gegenkonto_val) << ", ";  // decGegenkontoNr
         sql << FormatSqlValue(konto_val) << ", ";  // decKontoNr
-        sql << "NULL, ";  // decEaKontoNr
+        sql << FormatSqlValue(ea_konto_val) << ", ";  // decEaKontoNr
         sql << "'" << vorlauf_datum_bis << " 00:00:00', ";  // dtmVorlaufDatumBis
         sql << "'" << beleg_datum << "', ";  // dtmBelegDatum
-        sql << (ysn_soll_val.IsNull() ? "0" : (ysn_soll_val.GetValue<bool>() ? "1" : "0")) << ", ";  // ysnSoll
+        sql << (is_soll ? "1" : "0") << ", ";  // ysnSoll (parsed from sh/Soll/Haben)
         sql << FormatSqlValue(eingabe_betrag_val) << ", ";  // curEingabeBetrag
         sql << FormatSqlValue(basis_betrag_val) << ", ";  // curBasisBetrag
         sql << "NULL, ";  // curSkontoBetrag
@@ -829,7 +923,13 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     into_wz_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
 
-    ExtensionUtil::RegisterFunction(db, into_wz_func);
+    // Register using connection and catalog
+    Connection con(db);
+    con.BeginTransaction();
+    auto &catalog = Catalog::GetSystemCatalog(db);
+    CreateTableFunctionInfo info(into_wz_func);
+    catalog.CreateFunction(con.context, info);
+    con.Commit();
 }
 
 } // namespace duckdb
