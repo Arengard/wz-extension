@@ -26,11 +26,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. primanota_mapper.cpp and vorlauf_builder.cpp no longer exist in the project -- the build succeeds without them
   2. FindColumnIndex and timestamp generation each exist in exactly one place, used by all callers
   3. into_wz_function.cpp contains zero goto statements -- error flow uses structured control (early returns or result pattern)
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: Remove dead files and consolidate helpers
-- [ ] 01-02: Replace goto-based error flow with structured control
+- [ ] 01-01-PLAN.md -- Remove dead files and consolidate helpers into wz_utils.hpp
+- [ ] 01-02-PLAN.md -- Replace goto-based error flow with early returns and extracted sub-functions, fix guiVorlaufID bug
 
 ### Phase 2: Transaction Fix
 **Goal**: When `into_wz` runs, either all inserts (tblVorlauf + tblPrimanota) commit or none do -- and failures produce actionable error messages
