@@ -40,18 +40,18 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TXN-01 | — | Pending |
-| TXN-02 | — | Pending |
-| CLN-01 | — | Pending |
-| CLN-02 | — | Pending |
-| CLN-03 | — | Pending |
-| CST-01 | — | Pending |
+| TXN-01 | Phase 2 | Pending |
+| TXN-02 | Phase 2 | Pending |
+| CLN-01 | Phase 1 | Pending |
+| CLN-02 | Phase 1 | Pending |
+| CLN-03 | Phase 1 | Pending |
+| CST-01 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 6 total
-- Mapped to phases: 0
-- Unmapped: 6 ⚠️
+- Mapped to phases: 6
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-05*
-*Last updated: 2026-02-05 after initial definition*
+*Last updated: 2026-02-05 after roadmap creation*
