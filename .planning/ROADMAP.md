@@ -12,7 +12,7 @@ This roadmap delivers reliable, transactional accounting data imports by first c
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Code Cleanup** - Remove dead code, consolidate helpers, eliminate gotos
+- [x] **Phase 1: Code Cleanup** - Remove dead code, consolidate helpers, eliminate gotos
 - [ ] **Phase 2: Transaction Fix** - All-or-nothing insert guarantee with clear error messages
 - [ ] **Phase 3: Constraint Validation** - Pre-insert FK validation against MSSQL reference tables
 
@@ -29,8 +29,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md -- Remove dead files and consolidate helpers into wz_utils.hpp
-- [ ] 01-02-PLAN.md -- Replace goto-based error flow with early returns and extracted sub-functions, fix guiVorlaufID bug
+- [x] 01-01-PLAN.md -- Remove dead files and consolidate helpers into wz_utils.hpp
+- [x] 01-02-PLAN.md -- Replace goto-based error flow with early returns and extracted sub-functions, fix guiVorlaufID bug
 
 ### Phase 2: Transaction Fix
 **Goal**: When `into_wz` runs, either all inserts (tblVorlauf + tblPrimanota) commit or none do -- and failures produce actionable error messages
@@ -64,6 +64,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Code Cleanup | 0/2 | Not started | - |
+| 1. Code Cleanup | 2/2 | Complete | 2026-02-05 |
 | 2. Transaction Fix | 0/1 | Not started | - |
 | 3. Constraint Validation | 0/1 | Not started | - |

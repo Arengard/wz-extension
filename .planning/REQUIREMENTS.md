@@ -12,9 +12,9 @@
 
 ### Code Cleanup
 
-- [ ] **CLN-01**: Delete primanota_mapper.cpp and vorlauf_builder.cpp — unused earlier implementations superseded by into_wz_function.cpp
-- [ ] **CLN-02**: Consolidate duplicated helper functions (FindColumnIndex, timestamp generation) into wz_extension.hpp or a shared utils file
-- [ ] **CLN-03**: Replace goto-based error flow in IntoWzExecute with structured control flow (early returns or result pattern)
+- [x] **CLN-01**: Delete primanota_mapper.cpp and vorlauf_builder.cpp — unused earlier implementations superseded by into_wz_function.cpp
+- [x] **CLN-02**: Consolidate duplicated helper functions (FindColumnIndex, timestamp generation) into wz_extension.hpp or a shared utils file
+- [x] **CLN-03**: Replace goto-based error flow in IntoWzExecute with structured control flow (early returns or result pattern)
 
 ### Constraint Validation
 
@@ -42,9 +42,9 @@
 |-------------|-------|--------|
 | TXN-01 | Phase 2 | Pending |
 | TXN-02 | Phase 2 | Pending |
-| CLN-01 | Phase 1 | Pending |
-| CLN-02 | Phase 1 | Pending |
-| CLN-03 | Phase 1 | Pending |
+| CLN-01 | Phase 1 | Complete |
+| CLN-02 | Phase 1 | Complete |
+| CLN-03 | Phase 1 | Complete |
 | CST-01 | Phase 3 | Pending |
 
 **Coverage:**
@@ -54,4 +54,4 @@
 
 ---
 *Requirements defined: 2026-02-05*
-*Last updated: 2026-02-05 after roadmap creation*
+*Last updated: 2026-02-05 after Phase 1 completion*
