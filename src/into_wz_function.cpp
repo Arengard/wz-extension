@@ -259,6 +259,7 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
 
 // ============================================================================
 // Helper: Check for duplicate Primanota IDs
+// Uses a separate connection to avoid deadlock when called from table function
 // ============================================================================
 
 static vector<string> CheckDuplicates(ClientContext &context,
@@ -269,6 +270,10 @@ static vector<string> CheckDuplicates(ClientContext &context,
     if (primanota_ids.empty()) {
         return duplicates;
     }
+
+    // Create a new connection to avoid deadlock
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
 
     // Build IN clause (batch in groups of 100 to avoid query size limits)
     for (size_t batch_start = 0; batch_start < primanota_ids.size(); batch_start += 100) {
@@ -285,7 +290,7 @@ static vector<string> CheckDuplicates(ClientContext &context,
         string sql = "SELECT CAST(guiPrimanotaID AS VARCHAR(36)) FROM tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
         string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
 
-        auto result = context.Query(query, false);
+        auto result = conn.Query(query);
         if (!result->HasError()) {
             auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
             auto &collection = materialized->Collection();
@@ -526,17 +531,22 @@ static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &cont
 
 // ============================================================================
 // Helper: Execute SQL statement (for INSERT/UPDATE/DELETE)
+// Uses a separate connection to avoid deadlock when called from table function
 // ============================================================================
 
 static bool ExecuteMssqlStatement(ClientContext &context,
                                    const string &secret_name,
                                    const string &sql,
                                    string &error_message) {
+    // Create a new connection to avoid deadlock
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
+
     // Use mssql_scan with a wrapper that returns success indicator
     string wrapped_sql = sql + "; SELECT 1 AS success";
     string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + wrapped_sql + "$$)";
 
-    auto result = context.Query(query, false);
+    auto result = conn.Query(query);
     if (result->HasError()) {
         error_message = result->GetError();
         return false;
@@ -689,10 +699,14 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     {
         // =========================================================================
         // Step 2: Read source data from DuckDB table
+        // Use a separate connection to avoid deadlock
         // =========================================================================
 
+        auto &db = DatabaseInstance::GetDatabase(context);
+        Connection conn(db);
+
         string source_query = "SELECT * FROM " + bind_data.source_table;
-        auto source_result = context.Query(source_query, false);
+        auto source_result = conn.Query(source_query);
 
         if (source_result->HasError()) {
             AddErrorResult(bind_data, "ERROR", "Failed to read source table: " + source_result->GetError());
