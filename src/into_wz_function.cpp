@@ -816,30 +816,11 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     auto &bind_data = data_p.bind_data->CastNoConst<IntoWzBindData>();
     auto &global_state = data_p.global_state->Cast<IntoWzGlobalState>();
 
-    // If already executed, return remaining results
+    // Re-entry: return remaining results
     if (bind_data.executed) {
-        if (global_state.current_idx >= bind_data.results.size()) {
-            output.SetCardinality(0);
-            return;
-        }
-
-        idx_t count = 0;
-        while (global_state.current_idx < bind_data.results.size() && count < STANDARD_VECTOR_SIZE) {
-            auto &result = bind_data.results[global_state.current_idx];
-            output.SetValue(0, count, Value(result.table_name));
-            output.SetValue(1, count, Value(result.rows_inserted));
-            output.SetValue(2, count, Value(result.gui_vorlauf_id));
-            output.SetValue(3, count, Value(result.duration_seconds));
-            output.SetValue(4, count, Value(result.success));
-            output.SetValue(5, count, Value(result.error_message));
-            global_state.current_idx++;
-            count++;
-        }
-        output.SetCardinality(count);
+        OutputResults(bind_data, global_state, output);
         return;
     }
-
-    // Mark as executed
     bind_data.executed = true;
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -849,228 +830,131 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
     if (bind_data.gui_verfahren_id.empty()) {
         AddErrorResult(bind_data, "ERROR", "gui_verfahren_id is required");
-        goto output_results;
+        OutputResults(bind_data, global_state, output);
+        return;
     }
 
     if (bind_data.source_table.empty()) {
         AddErrorResult(bind_data, "ERROR", "source_table is required");
-        goto output_results;
+        OutputResults(bind_data, global_state, output);
+        return;
     }
 
-    {
-        // =========================================================================
-        // Step 2: Read source data from DuckDB table
-        // Use a separate connection to avoid deadlock
-        // =========================================================================
+    // =========================================================================
+    // Step 2: Load source data from DuckDB table
+    // =========================================================================
 
-        auto &db = DatabaseInstance::GetDatabase(context);
-        Connection conn(db);
-
-        string source_query = "SELECT * FROM " + bind_data.source_table;
-        auto source_result = conn.Query(source_query);
-
-        if (source_result->HasError()) {
-            AddErrorResult(bind_data, "ERROR", "Failed to read source table: " + source_result->GetError());
-            goto output_results;
-        }
-
-        auto source_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(source_result));
-
-        // Get column names and types
-        for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
-            bind_data.source_columns.push_back(source_materialized->ColumnName(i));
-            bind_data.source_types.push_back(source_materialized->types[i]);
-        }
-
-        // Collect all rows
-        auto &collection = source_materialized->Collection();
-        for (auto &chunk : collection.Chunks()) {
-            for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-                vector<Value> row;
-                for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
-                    row.push_back(chunk.data[col_idx].GetValue(row_idx));
-                }
-                bind_data.source_rows.push_back(std::move(row));
-            }
-        }
-
-        if (bind_data.source_rows.empty()) {
-            AddErrorResult(bind_data, "ERROR", "Source table is empty");
-            goto output_results;
-        }
-
-        // =========================================================================
-        // Step 3: Extract Primanota IDs and check for duplicates
-        // =========================================================================
-
-        idx_t primanota_id_col = FindColumnIndex(bind_data.source_columns, "guiPrimanotaID");
-        vector<string> primanota_ids;
-
-        if (primanota_id_col != DConstants::INVALID_INDEX) {
-            for (const auto &row : bind_data.source_rows) {
-                if (primanota_id_col < row.size() && !row[primanota_id_col].IsNull()) {
-                    primanota_ids.push_back(row[primanota_id_col].ToString());
-                }
-            }
-
-            auto duplicates = CheckDuplicates(context, bind_data.secret_name, primanota_ids);
-            if (!duplicates.empty()) {
-                string dup_list;
-                for (size_t i = 0; i < std::min(duplicates.size(), size_t(5)); i++) {
-                    if (i > 0) dup_list += ", ";
-                    dup_list += duplicates[i];
-                }
-                if (duplicates.size() > 5) {
-                    dup_list += " (and " + std::to_string(duplicates.size() - 5) + " more)";
-                }
-                AddErrorResult(bind_data, "ERROR",
-                    "Duplicate guiPrimanotaID found: " + dup_list +
-                    ". " + std::to_string(duplicates.size()) + " records already exist in tblPrimanota.");
-                goto output_results;
-            }
-        }
-
-        // =========================================================================
-        // Step 4: Generate Vorlauf data
-        // =========================================================================
-
-        string vorlauf_id = GenerateUUID();
-        pair<string, string> date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
-        string date_from = date_range.first;
-        string date_to = date_range.second;
-
-        if (date_from.empty()) {
-            // Default to current month
-            auto now = std::chrono::system_clock::now();
-            auto time = std::chrono::system_clock::to_time_t(now);
-            char buffer[32];
-            std::strftime(buffer, sizeof(buffer), "%Y-%m-01", std::localtime(&time));
-            date_from = string(buffer);
-        }
-        if (date_to.empty()) {
-            // Default to current date
-            auto now = std::chrono::system_clock::now();
-            auto time = std::chrono::system_clock::to_time_t(now);
-            char buffer[32];
-            std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", std::localtime(&time));
-            date_to = string(buffer);
-        }
-
-        string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
-
-        // =========================================================================
-        // Step 5: Create a single connection for transaction and insert data
-        // All transaction operations must use the same connection
-        // =========================================================================
-
-        string error_msg;
-        auto vorlauf_start = std::chrono::high_resolution_clock::now();
-
-        // Create a single connection for the entire transaction
-        auto &txn_db = DatabaseInstance::GetDatabase(context);
-        Connection txn_conn(txn_db);
-
-        // Begin transaction
-        if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
-            AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
-            goto output_results;
-        }
-
-        // Insert Vorlauf
-        {
-            string vorlauf_sql = BuildVorlaufInsertSQL(
-                bind_data.secret_name,
-                vorlauf_id,
-                bind_data.gui_verfahren_id,
-                bind_data.lng_kanzlei_konten_rahmen_id,
-                bind_data.str_angelegt,
-                date_from,
-                date_to,
-                bezeichnung
-            );
-
-            if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_msg)) {
-                // Rollback on error
-                string rollback_err;
-                ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-                AddErrorResult(bind_data, "tblVorlauf", "Insert failed: " + error_msg, vorlauf_id);
-                goto output_results;
-            }
-        }
-
-        auto vorlauf_end = std::chrono::high_resolution_clock::now();
-        double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-        AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
-
-        // =========================================================================
-        // Step 6: Insert Primanota records in batches
-        // =========================================================================
-
-        {
-            auto primanota_start = std::chrono::high_resolution_clock::now();
-            int64_t total_primanota_rows = 0;
-            const size_t BATCH_SIZE = 100;  // Insert 100 rows at a time
-
-            for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
-                size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
-
-                vector<vector<Value>> batch_rows(
-                    bind_data.source_rows.begin() + batch_start,
-                    bind_data.source_rows.begin() + batch_end
-                );
-
-                string primanota_sql = BuildPrimanotaInsertSQL(
-                    bind_data.secret_name,
-                    batch_rows,
-                    bind_data.source_columns,
-                    vorlauf_id,
-                    bind_data.gui_verfahren_id,
-                    bind_data.str_angelegt,
-                    date_to
-                );
-
-                if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_msg)) {
-                    // Rollback on error
-                    string rollback_err;
-                    ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-                    AddErrorResult(bind_data, "tblPrimanota",
-                        "Insert failed at row " + std::to_string(batch_start) + ": " + error_msg, vorlauf_id);
-                    goto output_results;
-                }
-
-                total_primanota_rows += batch_rows.size();
-            }
-
-            // =========================================================================
-            // Step 7: Commit transaction
-            // =========================================================================
-
-            if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
-                AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
-                goto output_results;
-            }
-
-            auto primanota_end = std::chrono::high_resolution_clock::now();
-            double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
-            AddSuccessResult(bind_data, "tblPrimanota", total_primanota_rows, vorlauf_id, primanota_duration);
-        }
+    string error_msg;
+    if (!LoadSourceData(context, bind_data, error_msg)) {
+        AddErrorResult(bind_data, "ERROR", error_msg);
+        OutputResults(bind_data, global_state, output);
+        return;
     }
 
-output_results:
-    // Return results
-    idx_t count = 0;
-    while (global_state.current_idx < bind_data.results.size() && count < STANDARD_VECTOR_SIZE) {
-        auto &result = bind_data.results[global_state.current_idx];
-        output.SetValue(0, count, Value(result.table_name));
-        output.SetValue(1, count, Value(result.rows_inserted));
-        output.SetValue(2, count, Value(result.gui_vorlauf_id));
-        output.SetValue(3, count, Value(result.duration_seconds));
-        output.SetValue(4, count, Value(result.success));
-        output.SetValue(5, count, Value(result.error_message));
-        global_state.current_idx++;
-        count++;
+    // =========================================================================
+    // Step 3: Check for duplicate Primanota IDs
+    // =========================================================================
+
+    if (!ValidateDuplicates(context, bind_data, error_msg)) {
+        AddErrorResult(bind_data, "ERROR", error_msg);
+        OutputResults(bind_data, global_state, output);
+        return;
     }
-    output.SetCardinality(count);
+
+    // =========================================================================
+    // Step 4: Prepare Vorlauf data
+    // BUG FIX: Use source guiVorlaufID if provided, otherwise generate UUID
+    // =========================================================================
+
+    string vorlauf_id;
+    idx_t vorlauf_id_col = FindColumnIndex(bind_data.source_columns, "guiVorlaufID");
+    if (vorlauf_id_col != DConstants::INVALID_INDEX
+        && !bind_data.source_rows.empty()
+        && vorlauf_id_col < bind_data.source_rows[0].size()
+        && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
+        vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
+    } else {
+        vorlauf_id = GenerateUUID();
+    }
+
+    auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+    string date_from = date_range.first;
+    string date_to = date_range.second;
+
+    if (date_from.empty()) {
+        // Default to current month
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        char buffer[32];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-01", std::localtime(&time));
+        date_from = string(buffer);
+    }
+    if (date_to.empty()) {
+        // Default to current date
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        char buffer[32];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", std::localtime(&time));
+        date_to = string(buffer);
+    }
+
+    string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
+
+    // =========================================================================
+    // Step 5: Begin transaction and insert Vorlauf
+    // =========================================================================
+
+    auto &txn_db = DatabaseInstance::GetDatabase(context);
+    Connection txn_conn(txn_db);
+
+    if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
+        AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    auto vorlauf_start = std::chrono::high_resolution_clock::now();
+    if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
+        string rollback_err;
+        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+        AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    auto vorlauf_end = std::chrono::high_resolution_clock::now();
+    double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+    AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
+
+    // =========================================================================
+    // Step 6: Insert Primanota rows
+    // =========================================================================
+
+    auto primanota_start = std::chrono::high_resolution_clock::now();
+    int64_t total_rows = 0;
+    if (!InsertPrimanota(txn_conn, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
+        string rollback_err;
+        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+        AddErrorResult(bind_data, "tblPrimanota", error_msg, vorlauf_id);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    // =========================================================================
+    // Step 7: Commit transaction
+    // =========================================================================
+
+    if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
+        AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    auto primanota_end = std::chrono::high_resolution_clock::now();
+    double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
+    AddSuccessResult(bind_data, "tblPrimanota", total_rows, vorlauf_id, primanota_duration);
+
+    OutputResults(bind_data, global_state, output);
 }
 
 // ============================================================================
