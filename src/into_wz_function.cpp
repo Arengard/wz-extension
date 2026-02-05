@@ -258,33 +258,6 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
 }
 
 // ============================================================================
-// Helper: Derive Vorlauf Bezeichnung from date range
-// ============================================================================
-
-string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
-    if (date_from.empty() || date_to.empty()) {
-        return "Vorlauf Import";
-    }
-
-    // Extract month/year from dates (format: YYYY-MM-DD)
-    int month_from = 1, year_from = 2025, month_to = 12, year_to = 2025;
-
-    if (date_from.length() >= 7) {
-        year_from = std::stoi(date_from.substr(0, 4));
-        month_from = std::stoi(date_from.substr(5, 2));
-    }
-    if (date_to.length() >= 7) {
-        year_to = std::stoi(date_to.substr(0, 4));
-        month_to = std::stoi(date_to.substr(5, 2));
-    }
-
-    char buffer[128];
-    snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d-%02d/%d",
-             month_from, year_from, month_to, year_to);
-    return string(buffer);
-}
-
-// ============================================================================
 // Helper: Check for duplicate Primanota IDs
 // ============================================================================
 
