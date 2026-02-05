@@ -24,8 +24,13 @@ std::string WzExtension::Version() const {
 
 extern "C" {
 
+// New C++ extension entry point (required for C++ ABI)
+DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
+    duckdb::RegisterIntoWzFunction(loader.GetDatabaseInstance());
+}
+
+// Legacy entry point (kept for compatibility)
 DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
-    // Register the function directly
     duckdb::RegisterIntoWzFunction(db);
 }
 
