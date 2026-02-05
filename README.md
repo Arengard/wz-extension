@@ -212,23 +212,38 @@ SELECT 0 AS ysnSoll;   -- Haben
 ### Example Source Data
 
 ```sql
+-- Load from JSON file
 CREATE TABLE my_data AS
 SELECT * FROM read_json_auto('bookings.json');
 
 -- Or from CSV
 CREATE TABLE my_data AS
 SELECT * FROM read_csv_auto('bookings.csv');
+```
 
--- Or manually
-CREATE TABLE my_data (
-    guiPrimanotaID VARCHAR,
-    dtmBelegDatum DATE,
-    decKontoNr DECIMAL,
-    decGegenkontoNr DECIMAL,
-    ysnSoll BOOLEAN,
-    curEingabeBetrag DECIMAL,
-    strBeleg1 VARCHAR,
-    strBuchText VARCHAR
+### Example with Alternative Column Names
+
+Your source data can use common German accounting column names:
+
+```sql
+CREATE TABLE buchungen AS
+SELECT
+    'abc-123-def' AS guiPrimanotaID,
+    '2025-09-01' AS datum,           -- maps to dtmBelegDatum
+    630014 AS konto,                 -- maps to decKontoNr
+    307000 AS gegenkonto,            -- maps to decGegenkontoNr
+    1234 AS eakonto,                 -- maps to decEaKontoNr
+    'H' AS sh,                       -- maps to ysnSoll (Haben = false)
+    854.15 AS umsatz,                -- maps to curEingabeBetrag
+    '12345' AS belegnummer,          -- maps to strBeleg1
+    'TRX-001' AS transnr,            -- maps to strBeleg2
+    'Buchungstext hier' AS buchungstext;  -- maps to strBuchText
+
+-- Import using the extension
+SELECT * FROM into_wz(
+    source_table := 'buchungen',
+    gui_verfahren_id := '6cd5c439-110a-4e65-b7b6-0be000b58588',
+    lng_kanzlei_konten_rahmen_id := 56
 );
 ```
 
@@ -355,15 +370,16 @@ $$);
 | guiPrimanotaID | UNIQUEIDENTIFIER | Source column or auto-generated |
 | guiVorlaufID | UNIQUEIDENTIFIER | From created tblVorlauf |
 | guiVerfahrenID | UNIQUEIDENTIFIER | Parameter: `gui_verfahren_id` |
-| decKontoNr | DECIMAL | Source: `decKontoNr` |
-| decGegenkontoNr | DECIMAL | Source: `decGegenkontoNr` |
-| dtmBelegDatum | DATETIME | Source: `dtmBelegDatum` |
-| ysnSoll | BIT | Source: `ysnSoll` |
-| curEingabeBetrag | MONEY | Source: `curEingabeBetrag` or `umsatz` |
-| curBasisBetrag | MONEY | Source: `curBasisBetrag` or `curEingabeBetrag` |
-| strBuchText | VARCHAR | Source: `strBuchText` |
-| strBeleg1 | VARCHAR | Source: `strBeleg1` |
-| strBeleg2 | VARCHAR | Source: `strBeleg2` |
+| decKontoNr | DECIMAL | Source: `konto`, `decKontoNr` |
+| decGegenkontoNr | DECIMAL | Source: `gegenkonto`, `decGegenkontoNr` |
+| decEaKontoNr | DECIMAL | Source: `eakonto`, `decEaKontoNr` |
+| dtmBelegDatum | DATETIME | Source: `datum`, `dtmBelegDatum` |
+| ysnSoll | BIT | Source: `sh`, `ysnSoll` (parsed from S/H/Soll/Haben) |
+| curEingabeBetrag | MONEY | Source: `umsatz`, `betrag`, `curEingabeBetrag` |
+| curBasisBetrag | MONEY | Source: `curBasisBetrag` (defaults to curEingabeBetrag) |
+| strBuchText | VARCHAR | Source: `buchungstext`, `strBuchText` |
+| strBeleg1 | VARCHAR | Source: `belegnummer`, `belegfeld1`, `strBeleg1` |
+| strBeleg2 | VARCHAR | Source: `transnr`, `belegfeld2`, `strBeleg2` |
 
 ## Development
 
