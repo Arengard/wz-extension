@@ -4,21 +4,58 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/query_result.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 #include "yyjson.hpp"
 #include <chrono>
+#include <sstream>
 
 namespace duckdb {
+
+// ============================================================================
+// Column name mappings from source data to tblPrimanota
+// ============================================================================
+
+struct ColumnMapping {
+    string source_name;
+    string target_name;
+    bool required;
+};
+
+static const vector<ColumnMapping> PRIMANOTA_COLUMN_MAPPINGS = {
+    {"guiPrimanotaID", "guiPrimanotaID", true},
+    {"dtmBelegDatum", "dtmBelegDatum", true},
+    {"decKontoNr", "decKontoNr", true},
+    {"decGegenkontoNr", "decGegenkontoNr", true},
+    {"ysnSoll", "ysnSoll", true},
+    {"curEingabeBetrag", "curEingabeBetrag", true},
+    {"curBasisBetrag", "curBasisBetrag", false},
+    {"strBeleg1", "strBeleg1", false},
+    {"strBeleg2", "strBeleg2", false},
+    {"strBuchText", "strBuchText", false},
+    {"umsatz", "curEingabeBetrag", false},  // Alternative name
+    {"umsatz_mit_vorzeichen", "curBasisBetrag", false},  // Alternative name
+    {"strbuchtext", "strBuchText", false},  // Case variation
+};
 
 // ============================================================================
 // Bind data for into_wz function
 // ============================================================================
 
 struct IntoWzBindData : public TableFunctionData {
-    string database;
+    string secret_name;           // MSSQL secret name
+    string source_table;          // Source table/query name
     string gui_verfahren_id;
     int64_t lng_kanzlei_konten_rahmen_id;
     string str_angelegt;
     bool generate_vorlauf_id;
+
+    // Source data column info
+    vector<string> source_columns;
+    vector<LogicalType> source_types;
+
+    // Collected source data
+    vector<vector<Value>> source_rows;
 
     // Results to return
     vector<InsertResult> results;
@@ -32,31 +69,8 @@ struct IntoWzBindData : public TableFunctionData {
 
 struct IntoWzGlobalState : public GlobalTableFunctionState {
     idx_t current_idx;
-
     IntoWzGlobalState() : current_idx(0) {}
 };
-
-// ============================================================================
-// Helper: Execute MSSQL query via mssql_scan
-// ============================================================================
-
-static unique_ptr<QueryResult> ExecuteMssqlQuery(ClientContext &context,
-                                                  const string &secret_name,
-                                                  const string &sql) {
-    string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
-    return context.Query(query, false);
-}
-
-// ============================================================================
-// Helper: Execute MSSQL statement via mssql_exec
-// ============================================================================
-
-static unique_ptr<QueryResult> ExecuteMssqlStatement(ClientContext &context,
-                                                      const string &secret_name,
-                                                      const string &sql) {
-    string query = "CALL mssql_exec('" + secret_name + "', $$" + sql + "$$)";
-    return context.Query(query, false);
-}
 
 // ============================================================================
 // Helper: Generate UUID v4
@@ -67,7 +81,7 @@ static string GenerateUUID() {
 }
 
 // ============================================================================
-// Helper: Get current timestamp
+// Helper: Get current timestamp for MSSQL
 // ============================================================================
 
 static string GetCurrentTimestamp() {
@@ -80,40 +94,17 @@ static string GetCurrentTimestamp() {
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
 
     char result[64];
-    snprintf(result, sizeof(result), "%s.%03d", buffer, static_cast<int>(ms.count()));
+    snprintf(result, sizeof(result), "%s.%02d", buffer, static_cast<int>(ms.count() / 10));
     return string(result);
 }
 
 // ============================================================================
-// Helper: Find min/max dates in data
-// ============================================================================
-
-static pair<string, string> FindDateRange(DataChunk &chunk, idx_t date_col_idx) {
-    string min_date, max_date;
-
-    auto &date_vec = chunk.data[date_col_idx];
-    for (idx_t i = 0; i < chunk.size(); i++) {
-        auto val = date_vec.GetValue(i);
-        if (!val.IsNull()) {
-            string date_str = val.ToString();
-            if (min_date.empty() || date_str < min_date) {
-                min_date = date_str;
-            }
-            if (max_date.empty() || date_str > max_date) {
-                max_date = date_str;
-            }
-        }
-    }
-
-    return {min_date, max_date};
-}
-
-// ============================================================================
-// Helper: Escape SQL string
+// Helper: Escape SQL string for MSSQL
 // ============================================================================
 
 static string EscapeSqlString(const string &str) {
     string result;
+    result.reserve(str.size() * 2);
     for (char c : str) {
         if (c == '\'') {
             result += "''";
@@ -125,7 +116,7 @@ static string EscapeSqlString(const string &str) {
 }
 
 // ============================================================================
-// Helper: Format value for SQL
+// Helper: Format value for SQL INSERT
 // ============================================================================
 
 static string FormatSqlValue(const Value &val) {
@@ -142,9 +133,346 @@ static string FormatSqlValue(const Value &val) {
         case LogicalTypeId::DATE:
         case LogicalTypeId::TIMESTAMP:
             return "'" + val.ToString() + "'";
+        case LogicalTypeId::UUID:
+            return "'" + val.ToString() + "'";
         default:
             return val.ToString();
     }
+}
+
+// ============================================================================
+// Helper: Find column index by name (case-insensitive)
+// ============================================================================
+
+static idx_t FindColumnIndex(const vector<string> &columns, const string &name) {
+    string name_lower = name;
+    std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+
+    for (idx_t i = 0; i < columns.size(); i++) {
+        string col_lower = columns[i];
+        std::transform(col_lower.begin(), col_lower.end(), col_lower.begin(), ::tolower);
+        if (col_lower == name_lower) {
+            return i;
+        }
+    }
+    return DConstants::INVALID_INDEX;
+}
+
+// ============================================================================
+// Helper: Find date range in source data
+// ============================================================================
+
+static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
+                                           const vector<string> &columns) {
+    string min_date, max_date;
+
+    // Look for dtmBelegDatum column
+    idx_t date_col = FindColumnIndex(columns, "dtmBelegDatum");
+    if (date_col == DConstants::INVALID_INDEX) {
+        // Try alternative names
+        date_col = FindColumnIndex(columns, "belegdatum");
+        if (date_col == DConstants::INVALID_INDEX) {
+            date_col = FindColumnIndex(columns, "datum");
+        }
+    }
+
+    if (date_col == DConstants::INVALID_INDEX) {
+        return {"", ""};
+    }
+
+    for (const auto &row : rows) {
+        if (date_col < row.size() && !row[date_col].IsNull()) {
+            string date_str = row[date_col].ToString();
+            // Normalize date string (take first 10 chars for YYYY-MM-DD)
+            if (date_str.length() >= 10) {
+                date_str = date_str.substr(0, 10);
+            }
+            if (min_date.empty() || date_str < min_date) {
+                min_date = date_str;
+            }
+            if (max_date.empty() || date_str > max_date) {
+                max_date = date_str;
+            }
+        }
+    }
+
+    return {min_date, max_date};
+}
+
+// ============================================================================
+// Helper: Derive Vorlauf Bezeichnung from date range
+// ============================================================================
+
+static string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
+    if (date_from.empty() || date_to.empty()) {
+        return "Vorlauf Import";
+    }
+
+    // Extract month/year from dates (format: YYYY-MM-DD)
+    int month_from = 1, year_from = 2025, month_to = 12, year_to = 2025;
+
+    if (date_from.length() >= 7) {
+        year_from = std::stoi(date_from.substr(0, 4));
+        month_from = std::stoi(date_from.substr(5, 2));
+    }
+    if (date_to.length() >= 7) {
+        year_to = std::stoi(date_to.substr(0, 4));
+        month_to = std::stoi(date_to.substr(5, 2));
+    }
+
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d-%02d/%d",
+             month_from, year_from, month_to, year_to);
+    return string(buffer);
+}
+
+// ============================================================================
+// Helper: Check for duplicate Primanota IDs
+// ============================================================================
+
+static vector<string> CheckDuplicates(ClientContext &context,
+                                       const string &secret_name,
+                                       const vector<string> &primanota_ids) {
+    vector<string> duplicates;
+
+    if (primanota_ids.empty()) {
+        return duplicates;
+    }
+
+    // Build IN clause (batch in groups of 100 to avoid query size limits)
+    for (size_t batch_start = 0; batch_start < primanota_ids.size(); batch_start += 100) {
+        size_t batch_end = std::min(batch_start + 100, primanota_ids.size());
+
+        string in_clause;
+        for (size_t i = batch_start; i < batch_end; i++) {
+            if (i > batch_start) {
+                in_clause += ", ";
+            }
+            in_clause += "'" + EscapeSqlString(primanota_ids[i]) + "'";
+        }
+
+        string sql = "SELECT CAST(guiPrimanotaID AS VARCHAR(36)) FROM tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
+        string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
+
+        auto result = context.Query(query, false);
+        if (!result->HasError()) {
+            auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+            auto &collection = materialized->Collection();
+            for (auto &chunk : collection.Chunks()) {
+                for (idx_t i = 0; i < chunk.size(); i++) {
+                    duplicates.push_back(chunk.data[0].GetValue(i).ToString());
+                }
+            }
+        }
+    }
+
+    return duplicates;
+}
+
+// ============================================================================
+// Helper: Build Vorlauf INSERT SQL
+// ============================================================================
+
+static string BuildVorlaufInsertSQL(const string &vorlauf_id,
+                                     const string &verfahren_id,
+                                     int64_t konten_rahmen_id,
+                                     const string &str_angelegt,
+                                     const string &date_from,
+                                     const string &date_to,
+                                     const string &bezeichnung) {
+    string timestamp = GetCurrentTimestamp();
+
+    std::ostringstream sql;
+    sql << "INSERT INTO tblVorlauf (";
+    sql << "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
+    sql << "guiVorlaufID, guiVerfahrenID, lngKanzleiKontenRahmenID, lngStatus, ";
+    sql << "dtmVorlaufDatumBis, dtmVorlaufDatumVon, lngVorlaufNr, strBezeichnung, ";
+    sql << "dtmDatevExport, ysnAutoBuSchluessel4stellig";
+    sql << ") VALUES (";
+    sql << "0, ";  // lngTimestamp
+    sql << "'" << EscapeSqlString(str_angelegt) << "', ";  // strAngelegt
+    sql << "'" << timestamp << "', ";  // dtmAngelegt
+    sql << "NULL, ";  // strGeaendert
+    sql << "NULL, ";  // dtmGeaendert
+    sql << "'" << vorlauf_id << "', ";  // guiVorlaufID
+    sql << "'" << verfahren_id << "', ";  // guiVerfahrenID
+    sql << konten_rahmen_id << ", ";  // lngKanzleiKontenRahmenID
+    sql << "1, ";  // lngStatus
+    sql << "'" << date_to << " 00:00:00', ";  // dtmVorlaufDatumBis
+    sql << "'" << date_from << " 00:00:00', ";  // dtmVorlaufDatumVon
+    sql << "NULL, ";  // lngVorlaufNr
+    sql << "'" << EscapeSqlString(bezeichnung) << "', ";  // strBezeichnung
+    sql << "NULL, ";  // dtmDatevExport
+    sql << "0";  // ysnAutoBuSchluessel4stellig
+    sql << ")";
+
+    return sql.str();
+}
+
+// ============================================================================
+// Helper: Build Primanota INSERT SQL for a batch of rows
+// ============================================================================
+
+static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
+                                       const vector<string> &columns,
+                                       const string &vorlauf_id,
+                                       const string &verfahren_id,
+                                       const string &str_angelegt,
+                                       const string &vorlauf_datum_bis) {
+    if (rows.empty()) {
+        return "";
+    }
+
+    string timestamp = GetCurrentTimestamp();
+
+    // Find column indices
+    idx_t col_primanota_id = FindColumnIndex(columns, "guiPrimanotaID");
+    idx_t col_beleg_datum = FindColumnIndex(columns, "dtmBelegDatum");
+    idx_t col_konto_nr = FindColumnIndex(columns, "decKontoNr");
+    idx_t col_gegenkonto_nr = FindColumnIndex(columns, "decGegenkontoNr");
+    idx_t col_ysn_soll = FindColumnIndex(columns, "ysnSoll");
+    idx_t col_eingabe_betrag = FindColumnIndex(columns, "curEingabeBetrag");
+    if (col_eingabe_betrag == DConstants::INVALID_INDEX) {
+        col_eingabe_betrag = FindColumnIndex(columns, "umsatz");
+    }
+    idx_t col_basis_betrag = FindColumnIndex(columns, "curBasisBetrag");
+    if (col_basis_betrag == DConstants::INVALID_INDEX) {
+        col_basis_betrag = FindColumnIndex(columns, "umsatz_mit_vorzeichen");
+    }
+    idx_t col_beleg1 = FindColumnIndex(columns, "strBeleg1");
+    idx_t col_beleg2 = FindColumnIndex(columns, "strBeleg2");
+    idx_t col_buch_text = FindColumnIndex(columns, "strBuchText");
+    if (col_buch_text == DConstants::INVALID_INDEX) {
+        col_buch_text = FindColumnIndex(columns, "strbuchtext");
+    }
+
+    std::ostringstream sql;
+    sql << "INSERT INTO tblPrimanota (";
+    sql << "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
+    sql << "guiPrimanotaID, guiVorlaufID, lngStatus, lngZeilenNr, lngEingabeWaehrungID, ";
+    sql << "lngBu, decGegenkontoNr, decKontoNr, decEaKontoNr, dtmVorlaufDatumBis, ";
+    sql << "dtmBelegDatum, ysnSoll, curEingabeBetrag, curBasisBetrag, curSkontoBetrag, ";
+    sql << "curSkontoBasisBetrag, decKostMenge, decWaehrungskurs, strBeleg1, strBeleg2, ";
+    sql << "strBuchText, strKost1, strKost2, strEuLand, strUstId, ";
+    sql << "decEuSteuersatz, dtmZusatzDatum, guiVerfahrenID, decEaSteuersatz, ";
+    sql << "ysnEaTransaktionenManuell, decEaNummer, lngSachverhalt13b, dtmLeistung, ";
+    sql << "ysnIstversteuerungInSollversteuerung, lngSkontoSachverhaltWarenRHB, ";
+    sql << "ysnVStBeiZahlung, guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell, ";
+    sql << "ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz";
+    sql << ") VALUES\n";
+
+    for (size_t i = 0; i < rows.size(); i++) {
+        const auto &row = rows[i];
+
+        if (i > 0) {
+            sql << ",\n";
+        }
+
+        // Get values from row with safe access
+        auto getValue = [&row](idx_t idx) -> Value {
+            if (idx == DConstants::INVALID_INDEX || idx >= row.size()) {
+                return Value();
+            }
+            return row[idx];
+        };
+
+        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateUUID() : getValue(col_primanota_id).ToString();
+        string beleg_datum = getValue(col_beleg_datum).IsNull() ? timestamp.substr(0, 10) : getValue(col_beleg_datum).ToString();
+        if (beleg_datum.length() > 10) {
+            beleg_datum = beleg_datum.substr(0, 10);
+        }
+        beleg_datum += " 00:00:00";
+
+        Value konto_val = getValue(col_konto_nr);
+        Value gegenkonto_val = getValue(col_gegenkonto_nr);
+        Value ysn_soll_val = getValue(col_ysn_soll);
+        Value eingabe_betrag_val = getValue(col_eingabe_betrag);
+        Value basis_betrag_val = getValue(col_basis_betrag);
+        Value beleg1_val = getValue(col_beleg1);
+        Value beleg2_val = getValue(col_beleg2);
+        Value buch_text_val = getValue(col_buch_text);
+
+        // Use eingabe_betrag for basis_betrag if not provided
+        if (basis_betrag_val.IsNull() && !eingabe_betrag_val.IsNull()) {
+            basis_betrag_val = eingabe_betrag_val;
+        }
+
+        sql << "(";
+        sql << "0, ";  // lngTimestamp
+        sql << "'" << EscapeSqlString(str_angelegt) << "', ";  // strAngelegt
+        sql << "'" << timestamp << "', ";  // dtmAngelegt
+        sql << "NULL, ";  // strGeaendert
+        sql << "NULL, ";  // dtmGeaendert
+        sql << "'" << EscapeSqlString(primanota_id) << "', ";  // guiPrimanotaID
+        sql << "'" << vorlauf_id << "', ";  // guiVorlaufID
+        sql << "1, ";  // lngStatus
+        sql << "NULL, ";  // lngZeilenNr
+        sql << "1, ";  // lngEingabeWaehrungID (EUR)
+        sql << "NULL, ";  // lngBu
+        sql << FormatSqlValue(gegenkonto_val) << ", ";  // decGegenkontoNr
+        sql << FormatSqlValue(konto_val) << ", ";  // decKontoNr
+        sql << "NULL, ";  // decEaKontoNr
+        sql << "'" << vorlauf_datum_bis << " 00:00:00', ";  // dtmVorlaufDatumBis
+        sql << "'" << beleg_datum << "', ";  // dtmBelegDatum
+        sql << (ysn_soll_val.IsNull() ? "0" : (ysn_soll_val.GetValue<bool>() ? "1" : "0")) << ", ";  // ysnSoll
+        sql << FormatSqlValue(eingabe_betrag_val) << ", ";  // curEingabeBetrag
+        sql << FormatSqlValue(basis_betrag_val) << ", ";  // curBasisBetrag
+        sql << "NULL, ";  // curSkontoBetrag
+        sql << "NULL, ";  // curSkontoBasisBetrag
+        sql << "NULL, ";  // decKostMenge
+        sql << "NULL, ";  // decWaehrungskurs
+        sql << (beleg1_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg1_val.ToString()) + "'") << ", ";  // strBeleg1
+        sql << (beleg2_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg2_val.ToString()) + "'") << ", ";  // strBeleg2
+        sql << (buch_text_val.IsNull() ? "NULL" : "'" + EscapeSqlString(buch_text_val.ToString()) + "'") << ", ";  // strBuchText
+        sql << "NULL, NULL, ";  // strKost1, strKost2
+        sql << "NULL, NULL, ";  // strEuLand, strUstId
+        sql << "NULL, NULL, ";  // decEuSteuersatz, dtmZusatzDatum
+        sql << "'" << verfahren_id << "', ";  // guiVerfahrenID
+        sql << "NULL, ";  // decEaSteuersatz
+        sql << "0, ";  // ysnEaTransaktionenManuell
+        sql << "NULL, NULL, NULL, ";  // decEaNummer, lngSachverhalt13b, dtmLeistung
+        sql << "0, NULL, 0, ";  // ysnIstversteuerung..., lngSkontoSachverhalt..., ysnVStBeiZahlung
+        sql << "NULL, 0, NULL, ";  // guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell
+        sql << "0, NULL, NULL, NULL";  // ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz
+        sql << ")";
+    }
+
+    return sql.str();
+}
+
+// ============================================================================
+// Helper: Execute SQL via mssql_scan (for queries that return data)
+// ============================================================================
+
+static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &context,
+                                                              const string &secret_name,
+                                                              const string &sql) {
+    string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + sql + "$$)";
+    auto result = context.Query(query, false);
+    if (result->HasError()) {
+        return nullptr;
+    }
+    return unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+}
+
+// ============================================================================
+// Helper: Execute SQL statement (for INSERT/UPDATE/DELETE)
+// ============================================================================
+
+static bool ExecuteMssqlStatement(ClientContext &context,
+                                   const string &secret_name,
+                                   const string &sql,
+                                   string &error_message) {
+    // Use mssql_scan with a wrapper that returns success indicator
+    string wrapped_sql = sql + "; SELECT 1 AS success";
+    string query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + wrapped_sql + "$$)";
+
+    auto result = context.Query(query, false);
+    if (result->HasError()) {
+        error_message = result->GetError();
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -159,8 +487,10 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
 
     // Parse named parameters
     for (auto &kv : input.named_parameters) {
-        if (kv.first == "database") {
-            bind_data->database = StringValue::Get(kv.second);
+        if (kv.first == "secret") {
+            bind_data->secret_name = StringValue::Get(kv.second);
+        } else if (kv.first == "source_table") {
+            bind_data->source_table = StringValue::Get(kv.second);
         } else if (kv.first == "gui_verfahren_id") {
             bind_data->gui_verfahren_id = StringValue::Get(kv.second);
         } else if (kv.first == "lng_kanzlei_konten_rahmen_id") {
@@ -173,8 +503,8 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
     }
 
     // Set defaults
-    if (bind_data->database.empty()) {
-        bind_data->database = "finaldatabase";
+    if (bind_data->secret_name.empty()) {
+        bind_data->secret_name = "mssql_conn";
     }
     if (bind_data->str_angelegt.empty()) {
         bind_data->str_angelegt = "wz_extension";
@@ -207,6 +537,38 @@ static unique_ptr<GlobalTableFunctionState> IntoWzInitGlobal(ClientContext &cont
 }
 
 // ============================================================================
+// Helper: Add error result
+// ============================================================================
+
+static void AddErrorResult(IntoWzBindData &bind_data, const string &table_name,
+                           const string &error_message, const string &vorlauf_id = "") {
+    InsertResult result;
+    result.table_name = table_name;
+    result.rows_inserted = 0;
+    result.gui_vorlauf_id = vorlauf_id;
+    result.duration_seconds = 0;
+    result.success = false;
+    result.error_message = error_message;
+    bind_data.results.push_back(result);
+}
+
+// ============================================================================
+// Helper: Add success result
+// ============================================================================
+
+static void AddSuccessResult(IntoWzBindData &bind_data, const string &table_name,
+                              int64_t rows, const string &vorlauf_id, double duration) {
+    InsertResult result;
+    result.table_name = table_name;
+    result.rows_inserted = rows;
+    result.gui_vorlauf_id = vorlauf_id;
+    result.duration_seconds = duration;
+    result.success = true;
+    result.error_message = "";
+    bind_data.results.push_back(result);
+}
+
+// ============================================================================
 // Main execution function
 // ============================================================================
 
@@ -214,7 +576,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     auto &bind_data = data_p.bind_data->CastNoConst<IntoWzBindData>();
     auto &global_state = data_p.global_state->Cast<IntoWzGlobalState>();
 
-    // If already executed, return results
+    // If already executed, return remaining results
     if (bind_data.executed) {
         if (global_state.current_idx >= bind_data.results.size()) {
             output.SetCardinality(0);
@@ -239,56 +601,204 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
     // Mark as executed
     bind_data.executed = true;
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Validate required parameters
+    // =========================================================================
+    // Step 1: Validate required parameters
+    // =========================================================================
+
     if (bind_data.gui_verfahren_id.empty()) {
-        InsertResult error_result;
-        error_result.table_name = "ERROR";
-        error_result.rows_inserted = 0;
-        error_result.gui_vorlauf_id = "";
-        error_result.duration_seconds = 0;
-        error_result.success = false;
-        error_result.error_message = "gui_verfahren_id is required";
-        bind_data.results.push_back(error_result);
-
-        output.SetValue(0, 0, Value(error_result.table_name));
-        output.SetValue(1, 0, Value(error_result.rows_inserted));
-        output.SetValue(2, 0, Value(error_result.gui_vorlauf_id));
-        output.SetValue(3, 0, Value(error_result.duration_seconds));
-        output.SetValue(4, 0, Value(error_result.success));
-        output.SetValue(5, 0, Value(error_result.error_message));
-        output.SetCardinality(1);
-        global_state.current_idx = 1;
-        return;
+        AddErrorResult(bind_data, "ERROR", "gui_verfahren_id is required");
+        goto output_results;
     }
 
-    // Generate Vorlauf ID
-    string vorlauf_id = GenerateUUID();
-    string current_timestamp = GetCurrentTimestamp();
+    if (bind_data.source_table.empty()) {
+        AddErrorResult(bind_data, "ERROR", "source_table is required");
+        goto output_results;
+    }
 
-    // For now, create placeholder results
-    // The actual implementation will query mssql_scan for constraints,
-    // build the Vorlauf record, map Primanota records, and execute inserts
+    {
+        // =========================================================================
+        // Step 2: Read source data from DuckDB table
+        // =========================================================================
 
-    InsertResult vorlauf_result;
-    vorlauf_result.table_name = "tblVorlauf";
-    vorlauf_result.rows_inserted = 1;
-    vorlauf_result.gui_vorlauf_id = vorlauf_id;
-    vorlauf_result.duration_seconds = 0.0;
-    vorlauf_result.success = true;
-    vorlauf_result.error_message = "";
-    bind_data.results.push_back(vorlauf_result);
+        string source_query = "SELECT * FROM " + bind_data.source_table;
+        auto source_result = context.Query(source_query, false);
 
-    InsertResult primanota_result;
-    primanota_result.table_name = "tblPrimanota";
-    primanota_result.rows_inserted = 0;  // Will be populated from actual data
-    primanota_result.gui_vorlauf_id = vorlauf_id;
-    primanota_result.duration_seconds = 0.0;
-    primanota_result.success = true;
-    primanota_result.error_message = "";
-    bind_data.results.push_back(primanota_result);
+        if (source_result->HasError()) {
+            AddErrorResult(bind_data, "ERROR", "Failed to read source table: " + source_result->GetError());
+            goto output_results;
+        }
 
-    // Return first batch of results
+        auto source_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(source_result));
+
+        // Get column names and types
+        for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
+            bind_data.source_columns.push_back(source_materialized->ColumnName(i));
+            bind_data.source_types.push_back(source_materialized->GetTypes()[i]);
+        }
+
+        // Collect all rows
+        auto &collection = source_materialized->Collection();
+        for (auto &chunk : collection.Chunks()) {
+            for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+                vector<Value> row;
+                for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+                    row.push_back(chunk.data[col_idx].GetValue(row_idx));
+                }
+                bind_data.source_rows.push_back(std::move(row));
+            }
+        }
+
+        if (bind_data.source_rows.empty()) {
+            AddErrorResult(bind_data, "ERROR", "Source table is empty");
+            goto output_results;
+        }
+
+        // =========================================================================
+        // Step 3: Extract Primanota IDs and check for duplicates
+        // =========================================================================
+
+        idx_t primanota_id_col = FindColumnIndex(bind_data.source_columns, "guiPrimanotaID");
+        vector<string> primanota_ids;
+
+        if (primanota_id_col != DConstants::INVALID_INDEX) {
+            for (const auto &row : bind_data.source_rows) {
+                if (primanota_id_col < row.size() && !row[primanota_id_col].IsNull()) {
+                    primanota_ids.push_back(row[primanota_id_col].ToString());
+                }
+            }
+
+            auto duplicates = CheckDuplicates(context, bind_data.secret_name, primanota_ids);
+            if (!duplicates.empty()) {
+                string dup_list;
+                for (size_t i = 0; i < std::min(duplicates.size(), size_t(5)); i++) {
+                    if (i > 0) dup_list += ", ";
+                    dup_list += duplicates[i];
+                }
+                if (duplicates.size() > 5) {
+                    dup_list += " (and " + std::to_string(duplicates.size() - 5) + " more)";
+                }
+                AddErrorResult(bind_data, "ERROR",
+                    "Duplicate guiPrimanotaID found: " + dup_list +
+                    ". " + std::to_string(duplicates.size()) + " records already exist in tblPrimanota.");
+                goto output_results;
+            }
+        }
+
+        // =========================================================================
+        // Step 4: Generate Vorlauf data
+        // =========================================================================
+
+        string vorlauf_id = GenerateUUID();
+        auto [date_from, date_to] = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+
+        if (date_from.empty()) {
+            // Default to current month
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            char buffer[32];
+            std::strftime(buffer, sizeof(buffer), "%Y-%m-01", std::localtime(&time));
+            date_from = string(buffer);
+        }
+        if (date_to.empty()) {
+            // Default to current date
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            char buffer[32];
+            std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", std::localtime(&time));
+            date_to = string(buffer);
+        }
+
+        string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
+
+        // =========================================================================
+        // Step 5: Begin transaction and insert Vorlauf
+        // =========================================================================
+
+        string error_msg;
+        auto vorlauf_start = std::chrono::high_resolution_clock::now();
+
+        // Begin transaction
+        if (!ExecuteMssqlStatement(context, bind_data.secret_name, "BEGIN TRANSACTION", error_msg)) {
+            AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
+            goto output_results;
+        }
+
+        // Insert Vorlauf
+        string vorlauf_sql = BuildVorlaufInsertSQL(
+            vorlauf_id,
+            bind_data.gui_verfahren_id,
+            bind_data.lng_kanzlei_konten_rahmen_id,
+            bind_data.str_angelegt,
+            date_from,
+            date_to,
+            bezeichnung
+        );
+
+        if (!ExecuteMssqlStatement(context, bind_data.secret_name, vorlauf_sql, error_msg)) {
+            // Rollback on error
+            ExecuteMssqlStatement(context, bind_data.secret_name, "ROLLBACK", error_msg);
+            AddErrorResult(bind_data, "tblVorlauf", "Insert failed: " + error_msg, vorlauf_id);
+            goto output_results;
+        }
+
+        auto vorlauf_end = std::chrono::high_resolution_clock::now();
+        double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+        AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
+
+        // =========================================================================
+        // Step 6: Insert Primanota records in batches
+        // =========================================================================
+
+        auto primanota_start = std::chrono::high_resolution_clock::now();
+        int64_t total_primanota_rows = 0;
+        const size_t BATCH_SIZE = 100;  // Insert 100 rows at a time
+
+        for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
+            size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
+
+            vector<vector<Value>> batch_rows(
+                bind_data.source_rows.begin() + batch_start,
+                bind_data.source_rows.begin() + batch_end
+            );
+
+            string primanota_sql = BuildPrimanotaInsertSQL(
+                batch_rows,
+                bind_data.source_columns,
+                vorlauf_id,
+                bind_data.gui_verfahren_id,
+                bind_data.str_angelegt,
+                date_to
+            );
+
+            if (!ExecuteMssqlStatement(context, bind_data.secret_name, primanota_sql, error_msg)) {
+                // Rollback on error
+                ExecuteMssqlStatement(context, bind_data.secret_name, "ROLLBACK", error_msg);
+                AddErrorResult(bind_data, "tblPrimanota",
+                    "Insert failed at row " + std::to_string(batch_start) + ": " + error_msg, vorlauf_id);
+                goto output_results;
+            }
+
+            total_primanota_rows += batch_rows.size();
+        }
+
+        // =========================================================================
+        // Step 7: Commit transaction
+        // =========================================================================
+
+        if (!ExecuteMssqlStatement(context, bind_data.secret_name, "COMMIT", error_msg)) {
+            AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
+            goto output_results;
+        }
+
+        auto primanota_end = std::chrono::high_resolution_clock::now();
+        double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
+        AddSuccessResult(bind_data, "tblPrimanota", total_primanota_rows, vorlauf_id, primanota_duration);
+    }
+
+output_results:
+    // Return results
     idx_t count = 0;
     while (global_state.current_idx < bind_data.results.size() && count < STANDARD_VECTOR_SIZE) {
         auto &result = bind_data.results[global_state.current_idx];
@@ -312,7 +822,8 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     TableFunction into_wz_func("into_wz", {}, IntoWzExecute, IntoWzBind, IntoWzInitGlobal);
 
     // Add named parameters
-    into_wz_func.named_parameters["database"] = LogicalType::VARCHAR;
+    into_wz_func.named_parameters["secret"] = LogicalType::VARCHAR;
+    into_wz_func.named_parameters["source_table"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["gui_verfahren_id"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["lng_kanzlei_konten_rahmen_id"] = LogicalType::BIGINT;
     into_wz_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
