@@ -259,11 +259,12 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
 
 // ============================================================================
 // Helper: Check for duplicate Primanota IDs
+// Uses attached database syntax: db_name.dbo.tblPrimanota
 // Uses a separate connection to avoid deadlock when called from table function
 // ============================================================================
 
 static vector<string> CheckDuplicates(ClientContext &context,
-                                       const string &secret_name,
+                                       const string &db_name,
                                        const vector<string> &primanota_ids) {
     vector<string> duplicates;
 
@@ -287,8 +288,8 @@ static vector<string> CheckDuplicates(ClientContext &context,
             in_clause += "'" + EscapeSqlString(primanota_ids[i]) + "'";
         }
 
-        string sql = "SELECT CAST(guiPrimanotaID AS VARCHAR(36)) AS id FROM tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
-        string query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "$$)";
+        // Query attached database directly
+        string query = "SELECT CAST(guiPrimanotaID AS VARCHAR) AS id FROM " + db_name + ".dbo.tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
 
         auto result = conn.Query(query);
         if (!result->HasError()) {
@@ -309,7 +310,8 @@ static vector<string> CheckDuplicates(ClientContext &context,
 // Helper: Build Vorlauf INSERT SQL
 // ============================================================================
 
-static string BuildVorlaufInsertSQL(const string &vorlauf_id,
+static string BuildVorlaufInsertSQL(const string &db_name,
+                                     const string &vorlauf_id,
                                      const string &verfahren_id,
                                      int64_t konten_rahmen_id,
                                      const string &str_angelegt,
@@ -319,7 +321,7 @@ static string BuildVorlaufInsertSQL(const string &vorlauf_id,
     string timestamp = GetCurrentTimestamp();
 
     std::ostringstream sql;
-    sql << "INSERT INTO tblVorlauf (";
+    sql << "INSERT INTO " << db_name << ".dbo.tblVorlauf (";
     sql << "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
     sql << "guiVorlaufID, guiVerfahrenID, lngKanzleiKontenRahmenID, lngStatus, ";
     sql << "dtmVorlaufDatumBis, dtmVorlaufDatumVon, lngVorlaufNr, strBezeichnung, ";
@@ -349,7 +351,8 @@ static string BuildVorlaufInsertSQL(const string &vorlauf_id,
 // Helper: Build Primanota INSERT SQL for a batch of rows
 // ============================================================================
 
-static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
+static string BuildPrimanotaInsertSQL(const string &db_name,
+                                       const vector<vector<Value>> &rows,
                                        const vector<string> &columns,
                                        const string &vorlauf_id,
                                        const string &verfahren_id,
@@ -419,7 +422,7 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
     });
 
     std::ostringstream sql;
-    sql << "INSERT INTO tblPrimanota (";
+    sql << "INSERT INTO " << db_name << ".dbo.tblPrimanota (";
     sql << "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
     sql << "guiPrimanotaID, guiVorlaufID, lngStatus, lngZeilenNr, lngEingabeWaehrungID, ";
     sql << "lngBu, decGegenkontoNr, decKontoNr, decEaKontoNr, dtmVorlaufDatumBis, ";
@@ -530,35 +533,24 @@ static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &cont
 }
 
 // ============================================================================
-// Helper: Execute SQL statement (for INSERT/UPDATE/DELETE)
+// Helper: Execute SQL statement on attached MSSQL database
+// The secret_name is the attached database name (e.g., 'mssql_conn')
 // Uses a separate connection to avoid deadlock when called from table function
 // ============================================================================
 
 static bool ExecuteMssqlStatement(ClientContext &context,
-                                   const string &secret_name,
+                                   const string &db_name,
                                    const string &sql,
                                    string &error_message) {
     // Create a new connection to avoid deadlock
     auto &db = DatabaseInstance::GetDatabase(context);
     Connection conn(db);
 
-    // Use mssql_execute for statements (INSERT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK)
-    // mssql_execute(secret, sql) returns affected rows
-    string query = "CALL mssql_execute('" + secret_name + "', $$" + sql + "$$)";
-
-    auto result = conn.Query(query);
+    // Execute SQL directly - the sql should reference tables as db_name.dbo.TableName
+    auto result = conn.Query(sql);
     if (result->HasError()) {
-        // Try alternative: use ATTACH + direct execution
         error_message = result->GetError();
-
-        // Fallback: try mssql_query which might work for some statements
-        string alt_query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "; SELECT 1 AS ok$$)";
-        auto alt_result = conn.Query(alt_query);
-        if (alt_result->HasError()) {
-            error_message = alt_result->GetError();
-            return false;
-        }
-        return true;
+        return false;
     }
     return true;
 }
@@ -821,6 +813,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
         // Insert Vorlauf
         string vorlauf_sql = BuildVorlaufInsertSQL(
+            bind_data.secret_name,
             vorlauf_id,
             bind_data.gui_verfahren_id,
             bind_data.lng_kanzlei_konten_rahmen_id,
@@ -858,6 +851,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             );
 
             string primanota_sql = BuildPrimanotaInsertSQL(
+                bind_data.secret_name,
                 batch_rows,
                 bind_data.source_columns,
                 vorlauf_id,

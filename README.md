@@ -54,7 +54,7 @@ LOAD mssql;
 LOAD wz;
 
 -- 2. Create MSSQL connection secret
-CREATE SECRET mssql_conn (
+CREATE SECRET mssql_secret (
     TYPE mssql,
     host 'your-server.database.windows.net',
     port 1433,
@@ -63,7 +63,10 @@ CREATE SECRET mssql_conn (
     password 'your_password'
 );
 
--- 3. Create your source data table
+-- 3. Attach MSSQL database using the secret
+ATTACH '' AS mssql_conn (TYPE mssql, SECRET mssql_secret);
+
+-- 4. Create your source data table
 CREATE TABLE my_bookings AS
 SELECT
     'ddebd948-4084-5c56-b339-f9b50474b586' AS guiPrimanotaID,
@@ -87,7 +90,8 @@ SELECT
     '0',
     'Sauna Poo org Gegenkonto:137005';
 
--- 4. Import data into WZ
+-- 5. Import data into WZ
+-- The 'secret' parameter is the attached database name (mssql_conn)
 SELECT * FROM into_wz(
     secret := 'mssql_conn',
     source_table := 'my_bookings',
