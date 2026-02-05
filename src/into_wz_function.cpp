@@ -261,7 +261,7 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
 // Helper: Derive Vorlauf Bezeichnung from date range
 // ============================================================================
 
-static string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
+string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
     if (date_from.empty() || date_to.empty()) {
         return "Vorlauf Import";
     }
@@ -731,7 +731,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         // Get column names and types
         for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
             bind_data.source_columns.push_back(source_materialized->ColumnName(i));
-            bind_data.source_types.push_back(source_materialized->GetTypes()[i]);
+            bind_data.source_types.push_back(source_materialized->types[i]);
         }
 
         // Collect all rows
@@ -930,7 +930,7 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     con.BeginTransaction();
     auto &catalog = Catalog::GetSystemCatalog(db);
     CreateTableFunctionInfo info(into_wz_func);
-    catalog.CreateFunction(con.context, info);
+    catalog.CreateFunction(*con.context, info);
     con.Commit();
 }
 
