@@ -12,12 +12,18 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      # ------------------------
+      # 1️⃣ Checkout code (shallow + submodules)
+      # ------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
+          fetch-depth: 1        # Only latest commit
+          submodules: true      # Shallow submodules
 
+      # ------------------------
+      # 2️⃣ Diagnostics
+      # ------------------------
       - name: Diagnostics (commit + source sanity)
         shell: bash
         run: |
@@ -26,84 +32,102 @@ jobs:
           git rev-parse HEAD
           git show -1 --oneline
 
+      # ------------------------
+      # 3️⃣ Cache Homebrew & CMake/Ninja
+      # ------------------------
+      - name: Cache Homebrew packages
+        uses: actions/cache@v3
+        with:
+          path: /usr/local/Homebrew/Library/Taps
+          key: brew-cache-${{ runner.os }}-${{ hashFiles('**/Brewfile.lock') }}
+          restore-keys: |
+            brew-cache-${{ runner.os }}-
+
+      # ------------------------
+      # 4️⃣ Install dependencies
+      # ------------------------
       - name: Install build dependencies
         run: |
           brew install cmake ninja
 
+      # ------------------------
+      # 5️⃣ Build extension (parallelized)
+      # ------------------------
       - name: Build extension (Release)
         env:
           BUILD_UNITTESTS: 0
           BUILD_SHELL: 0
         run: |
-          echo "Starting macOS release build process..."
-          make release
+          echo "Starting macOS release build..."
+          # Use all available CPU cores
+          make -j$(sysctl -n hw.ncpu) release
 
+      # ------------------------
+      # 6️⃣ Find and package extension
+      # ------------------------
       - name: Find and package extension
         run: |
-          # Create distribution directory
           mkdir -p dist
 
-          # Find the extension file
-          EXTENSION_FILE=$(find build -name "*.duckdb_extension" -type f | head -1)
+          # Use deterministic paths instead of scanning
+          EXTENSION_FILE=build/release/wz.duckdb_extension
+          DUCKDB_EXE=build/release/duckdb
 
-          if [ -z "$EXTENSION_FILE" ]; then
-            echo "No extension file found for packaging"
+          if [ ! -f "$EXTENSION_FILE" ]; then
+            echo "Extension file not found: $EXTENSION_FILE"
             exit 1
           fi
 
-          echo "Found extension file: $EXTENSION_FILE"
-
-          # Copy to dist with standard name
+          echo "Found extension: $EXTENSION_FILE"
           cp "$EXTENSION_FILE" dist/wz.duckdb_extension
 
-          # Get git info for versioning
+          # Metadata
           GIT_SHA=$(git rev-parse --short HEAD)
           GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
           BUILD_DATE=$(date -u +"%Y%m%d-%H%M%S")
 
-          # Create a metadata file
           cat > dist/build-info.txt << EOF
-          Build Information
-          =================
-          Extension: WZ DuckDB Extension
-          Platform: macOS (Apple Silicon / Intel)
-          Git Branch: ${GIT_BRANCH}
-          Git Commit: ${GIT_SHA}
-          Build Date: ${BUILD_DATE}
+Build Information
+=================
+Extension: WZ DuckDB Extension
+Platform: macOS (Apple Silicon / Intel)
+Git Branch: ${GIT_BRANCH}
+Git Commit: ${GIT_SHA}
+Build Date: ${BUILD_DATE}
 
-          Installation Instructions
-          =========================
-          1. Download wz.duckdb_extension
-          2. In DuckDB, run:
-             INSTALL './wz.duckdb_extension';
-             LOAD wz;
-          3. Test with:
-             SELECT * FROM into_wz_status();
-          EOF
+Installation Instructions
+=========================
+1. Download wz.duckdb_extension
+2. In DuckDB, run:
+   INSTALL './wz.duckdb_extension';
+   LOAD wz;
+3. Test with:
+   SELECT * FROM into_wz_status();
+EOF
 
           echo "Package contents:"
           ls -lh dist/
 
+      # ------------------------
+      # 7️⃣ Test extension loading
+      # ------------------------
       - name: Test extension loading
         run: |
-          # Find DuckDB executable
-          DUCKDB_EXE=$(find build -name "duckdb" -type f | head -1)
-
-          if [ -z "$DUCKDB_EXE" ]; then
+          if [ ! -f "$DUCKDB_EXE" ]; then
             echo "DuckDB executable not found, skipping test"
             exit 0
           fi
 
           echo "Testing extension with: $DUCKDB_EXE"
-
-          # Test loading the extension (allow unsigned since this is a local build)
-          "$DUCKDB_EXE" -unsigned -c "INSTALL 'dist/wz.duckdb_extension'; LOAD wz; SELECT 'Extension loaded successfully' as status;" || {
+          "$DUCKDB_EXE" -unsigned -c "INSTALL 'dist/wz.duckdb_extension'; LOAD wz; SELECT 'Extension loaded successfully' AS status;" || {
             echo "Extension failed to load"
             exit 1
           }
-
           echo "Extension loaded and tested successfully!"
 
+      # ------------------------
+      # 8️⃣ Upload artifacts
+      # ------------------------
       - name: Upload extension artifact
         uses: actions/upload-artifact@v4
         with:
@@ -122,6 +146,9 @@ jobs:
             dist/build-info.txt
           retention-days: 30
 
+      # ------------------------
+      # 9️⃣ Release creation on tag
+      # ------------------------
       - name: Create release on tag
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -134,6 +161,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ------------------------
+      # 🔟 Build summary
+      # ------------------------
       - name: Build summary
         run: |
           echo "## Build Successful!" >> $GITHUB_STEP_SUMMARY
