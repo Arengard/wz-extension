@@ -53,13 +53,13 @@ vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
 
     // Process results
     auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
-    for (auto &row : materialized->Collection()) {
-        for (idx_t i = 0; i < row.size(); i++) {
+    for (auto &chunk : materialized->Collection().Chunks()) {
+        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
             ForeignKeyConstraint fk;
-            fk.constraint_name = row.GetValue(0, i).ToString();
-            fk.column_name = row.GetValue(1, i).ToString();
-            fk.referenced_table = row.GetValue(2, i).ToString();
-            fk.referenced_column = row.GetValue(3, i).ToString();
+            fk.constraint_name = chunk.data[0].GetValue(row_idx).ToString();
+            fk.column_name = chunk.data[1].GetValue(row_idx).ToString();
+            fk.referenced_table = chunk.data[2].GetValue(row_idx).ToString();
+            fk.referenced_column = chunk.data[3].GetValue(row_idx).ToString();
             constraints.push_back(fk);
         }
     }
@@ -97,9 +97,9 @@ bool CheckDuplicatePrimanotaIds(ClientContext &context,
     }
 
     auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
-    for (auto &row : materialized->Collection()) {
-        for (idx_t i = 0; i < row.size(); i++) {
-            existing_ids.push_back(row.GetValue(0, i).ToString());
+    for (auto &chunk : materialized->Collection().Chunks()) {
+        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+            existing_ids.push_back(chunk.data[0].GetValue(row_idx).ToString());
         }
     }
 
