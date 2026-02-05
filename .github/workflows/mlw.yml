@@ -1,0 +1,214 @@
+name: Build DuckDB Extension (Multi-Platform)
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  # ------------------------
+  # 1️⃣ macOS universal build
+  # ------------------------
+  build-macos:
+    name: Build macOS Universal
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]  # Intel + Apple Silicon
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v3
+        with:
+          path: /usr/local/Homebrew/Library/Taps
+          key: brew-cache-${{ runner.os }}-${{ matrix.arch }}
+          restore-keys: brew-cache-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: brew install cmake ninja
+
+      - name: Build extension
+        env:
+          BUILD_UNITTESTS: 0
+          BUILD_SHELL: 0
+        run: |
+          mkdir -p build/${ARCH}
+          cd build/${ARCH}
+          cmake -G Ninja ../.. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Copy artifact
+        run: |
+          mkdir -p dist/${ARCH}
+          cp build/${ARCH}/wz.duckdb_extension dist/${ARCH}/wz.duckdb_extension
+
+  # ------------------------
+  # 2️⃣ Merge macOS universal binary
+  # ------------------------
+  merge-macos-universal:
+    name: Merge macOS Universal
+    runs-on: macos-latest
+    needs: build-macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Merge architectures
+        run: |
+          mkdir -p dist
+          lipo -create \
+            build/x86_64/wz.duckdb_extension \
+            build/arm64/wz.duckdb_extension \
+            -output dist/wz.duckdb_extension
+          file dist/wz.duckdb_extension
+
+  # ------------------------
+  # 3️⃣ Linux build
+  # ------------------------
+  build-linux:
+    name: Build Linux Extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - name: Cache CMake build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: build-cache-linux-${{ github.sha }}
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Build extension
+        env:
+          BUILD_UNITTESTS: 0
+          BUILD_SHELL: 0
+        run: |
+          mkdir -p build
+          cd build
+          cmake -G Ninja ../
+          cmake --build . --config Release -j$(nproc)
+          mkdir -p dist
+          cp wz.duckdb_extension dist/
+
+  # ------------------------
+  # 4️⃣ Windows build
+  # ------------------------
+  build-windows:
+    name: Build Windows Extension
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - name: Cache vcpkg
+        uses: actions/cache@v3
+        with:
+          path: vcpkg
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}
+
+      - name: Cache build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: build-cache-windows-${{ github.sha }}
+
+      - name: Install dependencies
+        run: choco install -y cmake ninja
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v1.0.2
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 'ce613c41372b23b1f51333815feb3edd87ef8a8b'
+
+      - name: Build extension
+        shell: pwsh
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          BUILD_UNITTESTS: 0
+          BUILD_SHELL: 0
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Ninja" ../ -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_TOOLCHAIN_PATH
+          cmake --build . --config Release -- /maxcpucount
+          mkdir dist
+          cp wz.duckdb_extension dist/
+
+  # ------------------------
+  # 5️⃣ Test artifacts (all platforms)
+  # ------------------------
+  test-artifacts:
+    name: Test Extension Artifacts
+    runs-on: ubuntu-latest
+    needs: [merge-macos-universal, build-linux, build-windows]
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: dist/macos
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: dist/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: dist/windows
+
+      - name: Run DuckDB load tests
+        run: |
+          echo "Testing macOS extension..."
+          duckdb -unsigned -c "INSTALL 'dist/macos/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
+          echo "Testing Linux extension..."
+          duckdb -unsigned -c "INSTALL 'dist/linux/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
+          echo "Testing Windows extension..."
+          duckdb -unsigned -c "INSTALL 'dist/windows/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
+
+  # ------------------------
+  # 6️⃣ Release creation
+  # ------------------------
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: test-artifacts
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/macos/wz.duckdb_extension
+            dist/linux/wz.duckdb_extension
+            dist/windows/wz.duckdb_extension
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
