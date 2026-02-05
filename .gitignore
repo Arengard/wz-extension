@@ -1,0 +1,32 @@
+# Build directories
+build/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# vcpkg
+vcpkg_installed/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Downloaded tools
+actionlint
+
+# CodeQL
+_codeql_detected_source_root
+
+# Git worktrees
+.worktrees/

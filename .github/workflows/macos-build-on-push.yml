@@ -1,0 +1,158 @@
+name: macOS Build on Push
+
+on:
+  push:
+    branches:
+      - '**'  # Build on every branch push
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build-macos:
+    name: Build macOS Extension
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Diagnostics (commit + source sanity)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          git rev-parse HEAD
+          git show -1 --oneline
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja
+
+      - name: Build extension (Release)
+        env:
+          BUILD_UNITTESTS: 0
+          BUILD_SHELL: 0
+        run: |
+          echo "Starting macOS release build process..."
+          make release
+
+      - name: Find and package extension
+        run: |
+          # Create distribution directory
+          mkdir -p dist
+
+          # Find the extension file
+          EXTENSION_FILE=$(find build -name "*.duckdb_extension" -type f | head -1)
+
+          if [ -z "$EXTENSION_FILE" ]; then
+            echo "No extension file found for packaging"
+            exit 1
+          fi
+
+          echo "Found extension file: $EXTENSION_FILE"
+
+          # Copy to dist with standard name
+          cp "$EXTENSION_FILE" dist/wz.duckdb_extension
+
+          # Get git info for versioning
+          GIT_SHA=$(git rev-parse --short HEAD)
+          GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          BUILD_DATE=$(date -u +"%Y%m%d-%H%M%S")
+
+          # Create a metadata file
+          cat > dist/build-info.txt << EOF
+          Build Information
+          =================
+          Extension: WZ DuckDB Extension
+          Platform: macOS (Apple Silicon / Intel)
+          Git Branch: ${GIT_BRANCH}
+          Git Commit: ${GIT_SHA}
+          Build Date: ${BUILD_DATE}
+
+          Installation Instructions
+          =========================
+          1. Download wz.duckdb_extension
+          2. In DuckDB, run:
+             INSTALL './wz.duckdb_extension';
+             LOAD wz;
+          3. Test with:
+             SELECT * FROM into_wz_status();
+          EOF
+
+          echo "Package contents:"
+          ls -lh dist/
+
+      - name: Test extension loading
+        run: |
+          # Find DuckDB executable
+          DUCKDB_EXE=$(find build -name "duckdb" -type f | head -1)
+
+          if [ -z "$DUCKDB_EXE" ]; then
+            echo "DuckDB executable not found, skipping test"
+            exit 0
+          fi
+
+          echo "Testing extension with: $DUCKDB_EXE"
+
+          # Test loading the extension (allow unsigned since this is a local build)
+          "$DUCKDB_EXE" -unsigned -c "INSTALL 'dist/wz.duckdb_extension'; LOAD wz; SELECT 'Extension loaded successfully' as status;" || {
+            echo "Extension failed to load"
+            exit 1
+          }
+
+          echo "Extension loaded and tested successfully!"
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-macos-universal-${{ github.sha }}
+          path: |
+            dist/wz.duckdb_extension
+            dist/build-info.txt
+          retention-days: 90
+
+      - name: Upload latest extension (branch-specific)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-macos-universal-latest-${{ github.ref_name }}
+          path: |
+            dist/wz.duckdb_extension
+            dist/build-info.txt
+          retention-days: 30
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/wz.duckdb_extension
+            dist/build-info.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build summary
+        run: |
+          echo "## Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts Created" >> $GITHUB_STEP_SUMMARY
+          echo "- **Extension File**: \`wz.duckdb_extension\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform**: macOS (Apple Silicon / Intel)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Download Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "1. Go to the [Actions tab](https://github.com/${{ github.repository }}/actions)" >> $GITHUB_STEP_SUMMARY
+          echo "2. Click on this workflow run" >> $GITHUB_STEP_SUMMARY
+          echo "3. Scroll to **Artifacts** section at the bottom" >> $GITHUB_STEP_SUMMARY
+          echo "4. Download \`wz-macos-universal-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`sql" >> $GITHUB_STEP_SUMMARY
+          echo "-- In DuckDB CLI:" >> $GITHUB_STEP_SUMMARY
+          echo "INSTALL './wz.duckdb_extension';" >> $GITHUB_STEP_SUMMARY
+          echo "LOAD wz;" >> $GITHUB_STEP_SUMMARY
+          echo "-- Then use into_wz function" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
