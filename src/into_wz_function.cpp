@@ -534,25 +534,30 @@ static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &cont
 
 // ============================================================================
 // Helper: Execute SQL statement on attached MSSQL database
-// The secret_name is the attached database name (e.g., 'mssql_conn')
-// Uses a separate connection to avoid deadlock when called from table function
+// The db_name is the attached database name (e.g., 'mssql_conn')
+// If conn_ptr is provided, uses that connection (for transaction continuity)
+// Otherwise creates a new connection
 // ============================================================================
 
-static bool ExecuteMssqlStatement(ClientContext &context,
-                                   const string &db_name,
-                                   const string &sql,
-                                   string &error_message) {
-    // Create a new connection to avoid deadlock
-    auto &db = DatabaseInstance::GetDatabase(context);
-    Connection conn(db);
-
-    // Execute SQL directly - the sql should reference tables as db_name.dbo.TableName
+static bool ExecuteMssqlStatementWithConn(Connection &conn,
+                                           const string &sql,
+                                           string &error_message) {
     auto result = conn.Query(sql);
     if (result->HasError()) {
         error_message = result->GetError();
         return false;
     }
     return true;
+}
+
+static bool ExecuteMssqlStatement(ClientContext &context,
+                                   const string &db_name,
+                                   const string &sql,
+                                   string &error_message) {
+    // Create a new connection - note: this won't maintain transaction state
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
+    return ExecuteMssqlStatementWithConn(conn, sql, error_message);
 }
 
 // ============================================================================
@@ -799,35 +804,43 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
 
         // =========================================================================
-        // Step 5: Begin transaction and insert Vorlauf
+        // Step 5: Create a single connection for transaction and insert data
+        // All transaction operations must use the same connection
         // =========================================================================
 
         string error_msg;
         auto vorlauf_start = std::chrono::high_resolution_clock::now();
 
+        // Create a single connection for the entire transaction
+        auto &db = DatabaseInstance::GetDatabase(context);
+        Connection txn_conn(db);
+
         // Begin transaction
-        if (!ExecuteMssqlStatement(context, bind_data.secret_name, "BEGIN TRANSACTION", error_msg)) {
+        if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
             AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
             goto output_results;
         }
 
         // Insert Vorlauf
-        string vorlauf_sql = BuildVorlaufInsertSQL(
-            bind_data.secret_name,
-            vorlauf_id,
-            bind_data.gui_verfahren_id,
-            bind_data.lng_kanzlei_konten_rahmen_id,
-            bind_data.str_angelegt,
-            date_from,
-            date_to,
-            bezeichnung
-        );
+        {
+            string vorlauf_sql = BuildVorlaufInsertSQL(
+                bind_data.secret_name,
+                vorlauf_id,
+                bind_data.gui_verfahren_id,
+                bind_data.lng_kanzlei_konten_rahmen_id,
+                bind_data.str_angelegt,
+                date_from,
+                date_to,
+                bezeichnung
+            );
 
-        if (!ExecuteMssqlStatement(context, bind_data.secret_name, vorlauf_sql, error_msg)) {
-            // Rollback on error
-            ExecuteMssqlStatement(context, bind_data.secret_name, "ROLLBACK", error_msg);
-            AddErrorResult(bind_data, "tblVorlauf", "Insert failed: " + error_msg, vorlauf_id);
-            goto output_results;
+            if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_msg)) {
+                // Rollback on error
+                string rollback_err;
+                ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+                AddErrorResult(bind_data, "tblVorlauf", "Insert failed: " + error_msg, vorlauf_id);
+                goto output_results;
+            }
         }
 
         auto vorlauf_end = std::chrono::high_resolution_clock::now();
@@ -838,51 +851,54 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         // Step 6: Insert Primanota records in batches
         // =========================================================================
 
-        auto primanota_start = std::chrono::high_resolution_clock::now();
-        int64_t total_primanota_rows = 0;
-        const size_t BATCH_SIZE = 100;  // Insert 100 rows at a time
+        {
+            auto primanota_start = std::chrono::high_resolution_clock::now();
+            int64_t total_primanota_rows = 0;
+            const size_t BATCH_SIZE = 100;  // Insert 100 rows at a time
 
-        for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
-            size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
+            for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
+                size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
 
-            vector<vector<Value>> batch_rows(
-                bind_data.source_rows.begin() + batch_start,
-                bind_data.source_rows.begin() + batch_end
-            );
+                vector<vector<Value>> batch_rows(
+                    bind_data.source_rows.begin() + batch_start,
+                    bind_data.source_rows.begin() + batch_end
+                );
 
-            string primanota_sql = BuildPrimanotaInsertSQL(
-                bind_data.secret_name,
-                batch_rows,
-                bind_data.source_columns,
-                vorlauf_id,
-                bind_data.gui_verfahren_id,
-                bind_data.str_angelegt,
-                date_to
-            );
+                string primanota_sql = BuildPrimanotaInsertSQL(
+                    bind_data.secret_name,
+                    batch_rows,
+                    bind_data.source_columns,
+                    vorlauf_id,
+                    bind_data.gui_verfahren_id,
+                    bind_data.str_angelegt,
+                    date_to
+                );
 
-            if (!ExecuteMssqlStatement(context, bind_data.secret_name, primanota_sql, error_msg)) {
-                // Rollback on error
-                ExecuteMssqlStatement(context, bind_data.secret_name, "ROLLBACK", error_msg);
-                AddErrorResult(bind_data, "tblPrimanota",
-                    "Insert failed at row " + std::to_string(batch_start) + ": " + error_msg, vorlauf_id);
+                if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_msg)) {
+                    // Rollback on error
+                    string rollback_err;
+                    ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+                    AddErrorResult(bind_data, "tblPrimanota",
+                        "Insert failed at row " + std::to_string(batch_start) + ": " + error_msg, vorlauf_id);
+                    goto output_results;
+                }
+
+                total_primanota_rows += batch_rows.size();
+            }
+
+            // =========================================================================
+            // Step 7: Commit transaction
+            // =========================================================================
+
+            if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
+                AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
                 goto output_results;
             }
 
-            total_primanota_rows += batch_rows.size();
+            auto primanota_end = std::chrono::high_resolution_clock::now();
+            double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
+            AddSuccessResult(bind_data, "tblPrimanota", total_primanota_rows, vorlauf_id, primanota_duration);
         }
-
-        // =========================================================================
-        // Step 7: Commit transaction
-        // =========================================================================
-
-        if (!ExecuteMssqlStatement(context, bind_data.secret_name, "COMMIT", error_msg)) {
-            AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
-            goto output_results;
-        }
-
-        auto primanota_end = std::chrono::high_resolution_clock::now();
-        double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
-        AddSuccessResult(bind_data, "tblPrimanota", total_primanota_rows, vorlauf_id, primanota_duration);
     }
 
 output_results:
