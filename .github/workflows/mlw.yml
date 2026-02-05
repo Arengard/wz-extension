@@ -100,6 +100,9 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Install build dependencies
+        run: choco install -y cmake ninja
+
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
