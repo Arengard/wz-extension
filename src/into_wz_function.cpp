@@ -1,4 +1,5 @@
 #include "wz_extension.hpp"
+#include "wz_utils.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -139,24 +140,6 @@ static string GenerateUUID() {
 }
 
 // ============================================================================
-// Helper: Get current timestamp for MSSQL
-// ============================================================================
-
-static string GetCurrentTimestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
-
-    char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
-
-    char result[64];
-    snprintf(result, sizeof(result), "%s.%02d", buffer, static_cast<int>(ms.count() / 10));
-    return string(result);
-}
-
-// ============================================================================
 // Helper: Escape SQL string for MSSQL
 // ============================================================================
 
@@ -196,24 +179,6 @@ static string FormatSqlValue(const Value &val) {
         default:
             return val.ToString();
     }
-}
-
-// ============================================================================
-// Helper: Find column index by name (case-insensitive)
-// ============================================================================
-
-static idx_t FindColumnIndex(const vector<string> &columns, const string &name) {
-    string name_lower = name;
-    std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
-
-    for (idx_t i = 0; i < columns.size(); i++) {
-        string col_lower = columns[i];
-        std::transform(col_lower.begin(), col_lower.end(), col_lower.begin(), ::tolower);
-        if (col_lower == name_lower) {
-            return i;
-        }
-    }
-    return DConstants::INVALID_INDEX;
 }
 
 // ============================================================================
