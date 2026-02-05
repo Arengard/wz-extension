@@ -8,27 +8,17 @@ on:
 
 jobs:
   # ------------------------
-  # 1️⃣ macOS universal build
+  # 1️⃣ macOS build
   # ------------------------
   build-macos:
-    name: Build macOS Universal
+    name: Build macOS Extension
     runs-on: macos-latest
-    strategy:
-      matrix:
-        arch: [x86_64, arm64]  # Intel + Apple Silicon
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          submodules: true
-
-      - name: Cache Homebrew packages
-        uses: actions/cache@v3
-        with:
-          path: /usr/local/Homebrew/Library/Taps
-          key: brew-cache-${{ runner.os }}-${{ matrix.arch }}
-          restore-keys: brew-cache-${{ runner.os }}-
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Install dependencies
         run: brew install cmake ninja
@@ -37,78 +27,38 @@ jobs:
         env:
           BUILD_UNITTESTS: 0
           BUILD_SHELL: 0
-          ARCH: ${{ matrix.arch }}
-        run: |
-          mkdir -p build/${{ matrix.arch }}
-          cd build/${{ matrix.arch }}
-          cmake -G Ninja ../.. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
-          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+        run: make release
 
       - name: Copy artifact
         run: |
-          mkdir -p dist/${{ matrix.arch }}
-          cp build/${{ matrix.arch }}/wz.duckdb_extension dist/${{ matrix.arch }}/wz.duckdb_extension
+          mkdir -p dist
+          EXTENSION_FILE=$(find build -name "*.duckdb_extension" -type f | head -1)
+          if [ -z "$EXTENSION_FILE" ]; then
+            echo "Extension file not found!"
+            find build -type f -name "*.duckdb_extension" || true
+            exit 1
+          fi
+          cp "$EXTENSION_FILE" dist/wz.duckdb_extension
 
-      - name: Upload architecture artifact
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wz-macos-${{ matrix.arch }}
-          path: dist/${{ matrix.arch }}/wz.duckdb_extension
-          retention-days: 1
-
-  # ------------------------
-  # 2️⃣ Merge macOS universal binary
-  # ------------------------
-  merge-macos-universal:
-    name: Merge macOS Universal
-    runs-on: macos-latest
-    needs: build-macos
-    steps:
-      - name: Download x86_64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wz-macos-x86_64
-          path: dist/x86_64
-
-      - name: Download arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wz-macos-arm64
-          path: dist/arm64
-
-      - name: Merge architectures
-        run: |
-          mkdir -p dist/universal
-          lipo -create \
-            dist/x86_64/wz.duckdb_extension \
-            dist/arm64/wz.duckdb_extension \
-            -output dist/universal/wz.duckdb_extension
-          file dist/universal/wz.duckdb_extension
-
-      - name: Upload universal artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wz-macos-universal
-          path: dist/universal/wz.duckdb_extension
+          name: wz-macos
+          path: dist/wz.duckdb_extension
           retention-days: 90
 
   # ------------------------
-  # 3️⃣ Linux build
+  # 2️⃣ Linux build
   # ------------------------
   build-linux:
     name: Build Linux Extension
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          submodules: true
-
-      - name: Cache CMake build
-        uses: actions/cache@v3
-        with:
-          path: build
-          key: build-cache-linux-${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
@@ -117,102 +67,81 @@ jobs:
         env:
           BUILD_UNITTESTS: 0
           BUILD_SHELL: 0
+        run: make release
+
+      - name: Copy artifact
         run: |
-          mkdir -p build
-          cd build
-          cmake -G Ninja ../
-          cmake --build . --config Release -j$(nproc)
           mkdir -p dist
-          cp wz.duckdb_extension dist/
+          EXTENSION_FILE=$(find build -name "*.duckdb_extension" -type f | head -1)
+          if [ -z "$EXTENSION_FILE" ]; then
+            echo "Extension file not found!"
+            find build -type f -name "*.duckdb_extension" || true
+            exit 1
+          fi
+          cp "$EXTENSION_FILE" dist/wz.duckdb_extension
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: wz-linux-amd64
-          path: build/dist/wz.duckdb_extension
+          path: dist/wz.duckdb_extension
           retention-days: 90
 
   # ------------------------
-  # 4️⃣ Windows build
+  # 3️⃣ Windows build
   # ------------------------
   build-windows:
     name: Build Windows Extension
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          submodules: true
-
-      - name: Cache vcpkg
-        uses: actions/cache@v3
-        with:
-          path: vcpkg
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}
-
-      - name: Cache build
-        uses: actions/cache@v3
-        with:
-          path: build
-          key: build-cache-windows-${{ github.sha }}
-
-      - name: Install dependencies
-        run: choco install -y cmake ninja
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v1.0.2
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11.1
-        with:
-          vcpkgGitCommitId: 'ce613c41372b23b1f51333815feb3edd87ef8a8b'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build extension
-        shell: pwsh
+        shell: bash
         env:
-          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
           BUILD_UNITTESTS: 0
           BUILD_SHELL: 0
+        run: make release
+
+      - name: Copy artifact
+        shell: bash
         run: |
-          mkdir build
-          cd build
-          cmake -G "Ninja" ../ -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_TOOLCHAIN_PATH
-          cmake --build . --config Release
-          mkdir dist
-          cp wz.duckdb_extension dist/
+          mkdir -p dist
+          EXTENSION_FILE=$(find build -name "*.duckdb_extension" -type f | head -1)
+          if [ -z "$EXTENSION_FILE" ]; then
+            echo "Extension file not found!"
+            find build -type f -name "*.duckdb_extension" || true
+            exit 1
+          fi
+          cp "$EXTENSION_FILE" dist/wz.duckdb_extension
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: wz-windows-amd64
-          path: build/dist/wz.duckdb_extension
+          path: dist/wz.duckdb_extension
           retention-days: 90
 
   # ------------------------
-  # 5️⃣ Test artifacts (all platforms)
+  # 4️⃣ Test artifacts
   # ------------------------
   test-artifacts:
     name: Test Extension Artifacts
     runs-on: ubuntu-latest
-    needs: [merge-macos-universal, build-linux, build-windows]
+    needs: [build-macos, build-linux, build-windows]
     steps:
-      - name: Download macOS artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wz-macos-universal
-          path: dist/macos
-
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
           name: wz-linux-amd64
           path: dist/linux
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wz-windows-amd64
-          path: dist/windows
 
       - name: Install DuckDB
         run: |
@@ -227,7 +156,7 @@ jobs:
           echo "Linux extension test passed!"
 
   # ------------------------
-  # 6️⃣ Release creation
+  # 5️⃣ Release creation
   # ------------------------
   release:
     name: Create GitHub Release
@@ -238,7 +167,7 @@ jobs:
       - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
-          name: wz-macos-universal
+          name: wz-macos
           path: dist/macos
 
       - name: Download Linux artifact
@@ -255,7 +184,7 @@ jobs:
 
       - name: Rename artifacts for release
         run: |
-          mv dist/macos/wz.duckdb_extension dist/wz-macos-universal.duckdb_extension
+          mv dist/macos/wz.duckdb_extension dist/wz-macos.duckdb_extension
           mv dist/linux/wz.duckdb_extension dist/wz-linux-amd64.duckdb_extension
           mv dist/windows/wz.duckdb_extension dist/wz-windows-amd64.duckdb_extension
 
@@ -263,7 +192,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/wz-macos-universal.duckdb_extension
+            dist/wz-macos.duckdb_extension
             dist/wz-linux-amd64.duckdb_extension
             dist/wz-windows-amd64.duckdb_extension
           draft: false
