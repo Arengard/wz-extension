@@ -619,6 +619,196 @@ static void AddSuccessResult(IntoWzBindData &bind_data, const string &table_name
 }
 
 // ============================================================================
+// Output accumulated results from bind_data to the DataChunk.
+// Handles pagination: picks up from global_state.current_idx.
+// ============================================================================
+
+static void OutputResults(IntoWzBindData &bind_data,
+                          IntoWzGlobalState &global_state,
+                          DataChunk &output) {
+    if (global_state.current_idx >= bind_data.results.size()) {
+        output.SetCardinality(0);
+        return;
+    }
+
+    idx_t count = 0;
+    while (global_state.current_idx < bind_data.results.size() && count < STANDARD_VECTOR_SIZE) {
+        auto &result = bind_data.results[global_state.current_idx];
+        output.SetValue(0, count, Value(result.table_name));
+        output.SetValue(1, count, Value(result.rows_inserted));
+        output.SetValue(2, count, Value(result.gui_vorlauf_id));
+        output.SetValue(3, count, Value(result.duration_seconds));
+        output.SetValue(4, count, Value(result.success));
+        output.SetValue(5, count, Value(result.error_message));
+        global_state.current_idx++;
+        count++;
+    }
+    output.SetCardinality(count);
+}
+
+// ============================================================================
+// Read source table into bind_data.source_columns, source_types, and source_rows.
+// Returns true on success, sets error_message on failure.
+// ============================================================================
+
+static bool LoadSourceData(ClientContext &context,
+                           IntoWzBindData &bind_data,
+                           string &error_message) {
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
+
+    string source_query = "SELECT * FROM " + bind_data.source_table;
+    auto source_result = conn.Query(source_query);
+
+    if (source_result->HasError()) {
+        error_message = "Failed to read source table: " + source_result->GetError();
+        return false;
+    }
+
+    auto source_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(source_result));
+
+    // Get column names and types
+    for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
+        bind_data.source_columns.push_back(source_materialized->ColumnName(i));
+        bind_data.source_types.push_back(source_materialized->types[i]);
+    }
+
+    // Collect all rows
+    auto &collection = source_materialized->Collection();
+    for (auto &chunk : collection.Chunks()) {
+        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+            vector<Value> row;
+            for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+                row.push_back(chunk.data[col_idx].GetValue(row_idx));
+            }
+            bind_data.source_rows.push_back(std::move(row));
+        }
+    }
+
+    if (bind_data.source_rows.empty()) {
+        error_message = "Source table is empty";
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Check if any guiPrimanotaID values already exist in tblPrimanota.
+// Returns true if no duplicates (safe to proceed), false if duplicates found.
+// ============================================================================
+
+static bool ValidateDuplicates(ClientContext &context,
+                               IntoWzBindData &bind_data,
+                               string &error_message) {
+    idx_t primanota_id_col = FindColumnIndex(bind_data.source_columns, "guiPrimanotaID");
+
+    if (primanota_id_col == DConstants::INVALID_INDEX) {
+        return true;  // No IDs to check
+    }
+
+    vector<string> primanota_ids;
+    for (const auto &row : bind_data.source_rows) {
+        if (primanota_id_col < row.size() && !row[primanota_id_col].IsNull()) {
+            primanota_ids.push_back(row[primanota_id_col].ToString());
+        }
+    }
+
+    auto duplicates = CheckDuplicates(context, bind_data.secret_name, primanota_ids);
+    if (!duplicates.empty()) {
+        string dup_list;
+        for (size_t i = 0; i < std::min(duplicates.size(), size_t(5)); i++) {
+            if (i > 0) dup_list += ", ";
+            dup_list += duplicates[i];
+        }
+        if (duplicates.size() > 5) {
+            dup_list += " (and " + std::to_string(duplicates.size() - 5) + " more)";
+        }
+        error_message = "Duplicate guiPrimanotaID found: " + dup_list +
+            ". " + std::to_string(duplicates.size()) + " records already exist in tblPrimanota.";
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Insert a single tblVorlauf record via the transaction connection.
+// Returns true on success, sets error_message on failure.
+// ============================================================================
+
+static bool InsertVorlauf(Connection &txn_conn,
+                          IntoWzBindData &bind_data,
+                          const string &vorlauf_id,
+                          const string &date_from,
+                          const string &date_to,
+                          const string &bezeichnung,
+                          string &error_message) {
+    string vorlauf_sql = BuildVorlaufInsertSQL(
+        bind_data.secret_name,
+        vorlauf_id,
+        bind_data.gui_verfahren_id,
+        bind_data.lng_kanzlei_konten_rahmen_id,
+        bind_data.str_angelegt,
+        date_from,
+        date_to,
+        bezeichnung
+    );
+
+    if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_message)) {
+        error_message = "Failed to insert Vorlauf: " + error_message;
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Insert all source rows into tblPrimanota in batches of 100.
+// Returns true on success, sets total_rows and error_message on failure.
+// ============================================================================
+
+static bool InsertPrimanota(Connection &txn_conn,
+                            IntoWzBindData &bind_data,
+                            const string &vorlauf_id,
+                            const string &date_to,
+                            int64_t &total_rows,
+                            string &error_message) {
+    const size_t BATCH_SIZE = 100;
+    total_rows = 0;
+
+    for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
+
+        vector<vector<Value>> batch_rows(
+            bind_data.source_rows.begin() + batch_start,
+            bind_data.source_rows.begin() + batch_end
+        );
+
+        string primanota_sql = BuildPrimanotaInsertSQL(
+            bind_data.secret_name,
+            batch_rows,
+            bind_data.source_columns,
+            vorlauf_id,
+            bind_data.gui_verfahren_id,
+            bind_data.str_angelegt,
+            date_to
+        );
+
+        if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
+            error_message = "Failed to insert tblPrimanota rows " +
+                std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
+                ": " + error_message;
+            return false;
+        }
+
+        total_rows += batch_rows.size();
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Main execution function
 // ============================================================================
 
