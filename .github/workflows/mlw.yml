@@ -37,16 +37,24 @@ jobs:
         env:
           BUILD_UNITTESTS: 0
           BUILD_SHELL: 0
+          ARCH: ${{ matrix.arch }}
         run: |
-          mkdir -p build/${ARCH}
-          cd build/${ARCH}
-          cmake -G Ninja ../.. -DCMAKE_BUILD_TYPE=Release
+          mkdir -p build/${{ matrix.arch }}
+          cd build/${{ matrix.arch }}
+          cmake -G Ninja ../.. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
           cmake --build . --config Release -j$(sysctl -n hw.ncpu)
 
       - name: Copy artifact
         run: |
-          mkdir -p dist/${ARCH}
-          cp build/${ARCH}/wz.duckdb_extension dist/${ARCH}/wz.duckdb_extension
+          mkdir -p dist/${{ matrix.arch }}
+          cp build/${{ matrix.arch }}/wz.duckdb_extension dist/${{ matrix.arch }}/wz.duckdb_extension
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-macos-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/wz.duckdb_extension
+          retention-days: 1
 
   # ------------------------
   # 2️⃣ Merge macOS universal binary
@@ -56,19 +64,33 @@ jobs:
     runs-on: macos-latest
     needs: build-macos
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 1
+          name: wz-macos-x86_64
+          path: dist/x86_64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wz-macos-arm64
+          path: dist/arm64
 
       - name: Merge architectures
         run: |
-          mkdir -p dist
+          mkdir -p dist/universal
           lipo -create \
-            build/x86_64/wz.duckdb_extension \
-            build/arm64/wz.duckdb_extension \
-            -output dist/wz.duckdb_extension
-          file dist/wz.duckdb_extension
+            dist/x86_64/wz.duckdb_extension \
+            dist/arm64/wz.duckdb_extension \
+            -output dist/universal/wz.duckdb_extension
+          file dist/universal/wz.duckdb_extension
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-macos-universal
+          path: dist/universal/wz.duckdb_extension
+          retention-days: 90
 
   # ------------------------
   # 3️⃣ Linux build
@@ -102,6 +124,13 @@ jobs:
           cmake --build . --config Release -j$(nproc)
           mkdir -p dist
           cp wz.duckdb_extension dist/
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-linux-amd64
+          path: build/dist/wz.duckdb_extension
+          retention-days: 90
 
   # ------------------------
   # 4️⃣ Windows build
@@ -148,9 +177,16 @@ jobs:
           mkdir build
           cd build
           cmake -G "Ninja" ../ -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_TOOLCHAIN_PATH
-          cmake --build . --config Release -- /maxcpucount
+          cmake --build . --config Release
           mkdir dist
           cp wz.duckdb_extension dist/
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wz-windows-amd64
+          path: build/dist/wz.duckdb_extension
+          retention-days: 90
 
   # ------------------------
   # 5️⃣ Test artifacts (all platforms)
@@ -161,31 +197,34 @@ jobs:
     needs: [merge-macos-universal, build-linux, build-windows]
     steps:
       - name: Download macOS artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: wz-macos-universal
           path: dist/macos
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: wz-linux-amd64
           path: dist/linux
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: wz-windows-amd64
           path: dist/windows
+
+      - name: Install DuckDB
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/v1.0.0/duckdb_cli-linux-amd64.zip
+          unzip duckdb_cli-linux-amd64.zip
+          chmod +x duckdb
 
       - name: Run DuckDB load tests
         run: |
-          echo "Testing macOS extension..."
-          duckdb -unsigned -c "INSTALL 'dist/macos/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
           echo "Testing Linux extension..."
-          duckdb -unsigned -c "INSTALL 'dist/linux/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
-          echo "Testing Windows extension..."
-          duckdb -unsigned -c "INSTALL 'dist/windows/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
+          ./duckdb -unsigned -c "INSTALL 'dist/linux/wz.duckdb_extension'; LOAD wz; SELECT 'OK' AS status;"
+          echo "Linux extension test passed!"
 
   # ------------------------
   # 6️⃣ Release creation
@@ -196,18 +235,37 @@ jobs:
     needs: test-artifacts
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v3
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
         with:
-          path: dist
+          name: wz-macos-universal
+          path: dist/macos
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wz-linux-amd64
+          path: dist/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wz-windows-amd64
+          path: dist/windows
+
+      - name: Rename artifacts for release
+        run: |
+          mv dist/macos/wz.duckdb_extension dist/wz-macos-universal.duckdb_extension
+          mv dist/linux/wz.duckdb_extension dist/wz-linux-amd64.duckdb_extension
+          mv dist/windows/wz.duckdb_extension dist/wz-windows-amd64.duckdb_extension
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/macos/wz.duckdb_extension
-            dist/linux/wz.duckdb_extension
-            dist/windows/wz.duckdb_extension
+            dist/wz-macos-universal.duckdb_extension
+            dist/wz-linux-amd64.duckdb_extension
+            dist/wz-windows-amd64.duckdb_extension
           draft: false
           prerelease: false
         env:

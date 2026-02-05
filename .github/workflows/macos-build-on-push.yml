@@ -113,6 +113,7 @@ EOF
       # ------------------------
       - name: Test extension loading
         run: |
+          DUCKDB_EXE=build/release/duckdb
           if [ ! -f "$DUCKDB_EXE" ]; then
             echo "DuckDB executable not found, skipping test"
             exit 0

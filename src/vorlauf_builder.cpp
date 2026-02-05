@@ -120,7 +120,9 @@ VorlaufRecord BuildVorlaufFromData(DataChunk &data,
     vorlauf.ysn_auto_bu_schluessel_4stellig = false;
 
     // Derive date range from data
-    auto [date_from, date_to] = FindDateRangeInData(data, "dtmBelegDatum");
+    auto date_range = FindDateRangeInData(data, "dtmBelegDatum");
+    std::string date_from = date_range.first;
+    std::string date_to = date_range.second;
 
     if (!date_from.empty()) {
         // Convert date to datetime format (add 00:00:00 if needed)
