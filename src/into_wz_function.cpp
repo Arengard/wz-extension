@@ -427,11 +427,13 @@ static string BuildPrimanotaInsertSQL(const vector<vector<Value>> &rows,
     });
 
     idx_t col_beleg1 = findColumnWithFallbacks({
-        "strBeleg1", "beleg1", "beleg_1", "belegnr", "belegnummer"
+        "strBeleg1", "beleg1", "beleg_1", "belegfeld1", "belegfeld_1",
+        "belegnr", "belegnummer", "beleg_nr", "beleg_nummer"
     });
 
     idx_t col_beleg2 = findColumnWithFallbacks({
-        "strBeleg2", "beleg2", "beleg_2"
+        "strBeleg2", "beleg2", "beleg_2", "belegfeld2", "belegfeld_2",
+        "trans_nr", "transnr", "trans_nummer", "transaktionsnr"
     });
 
     idx_t col_buch_text = findColumnWithFallbacks({

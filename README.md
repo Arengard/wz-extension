@@ -186,8 +186,8 @@ The extension recognizes many alternative column names (case-insensitive):
 | `sh`, `soll_haben`, `sollhaben` | `ysnSoll` |
 | `buchungstext`, `buchtext`, `text` | `strBuchText` |
 | `belegdatum`, `datum`, `date` | `dtmBelegDatum` |
-| `beleg1`, `beleg_1`, `belegnr` | `strBeleg1` |
-| `beleg2`, `beleg_2` | `strBeleg2` |
+| `beleg1`, `belegfeld1`, `belegnr`, `belegnummer` | `strBeleg1` |
+| `beleg2`, `belegfeld2`, `trans_nr`, `transnr` | `strBeleg2` |
 
 ### Soll/Haben (sh) Column Parsing
 
