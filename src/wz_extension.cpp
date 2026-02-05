@@ -3,7 +3,6 @@
 #include "wz_extension.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
-#include "duckdb/main/extension_entries.hpp"
 #include "duckdb/main/database.hpp"
 
 namespace duckdb {
@@ -26,9 +25,8 @@ std::string WzExtension::Version() const {
 extern "C" {
 
 DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
-    duckdb::ExtensionLoader loader(db);
-    duckdb::WzExtension extension;
-    extension.Load(loader);
+    // Register the function directly
+    duckdb::RegisterIntoWzFunction(db);
 }
 
 DUCKDB_EXTENSION_API const char *wz_version() {

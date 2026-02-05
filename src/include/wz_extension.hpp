@@ -5,7 +5,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/extension.hpp"
-#include "duckdb/main/extension_entries.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 
