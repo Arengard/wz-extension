@@ -60,15 +60,11 @@ vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
                                                        const string &secret_name,
                                                        const string &table_name);
 
-vector<ConstraintViolation> ValidateConstraints(ClientContext &context,
-                                                 const string &secret_name,
-                                                 const string &table_name,
-                                                 DataChunk &data);
-
-bool CheckDuplicatePrimanotaIds(ClientContext &context,
-                                const string &secret_name,
-                                const vector<string> &primanota_ids,
-                                vector<string> &existing_ids);
+bool ValidateForeignKeys(ClientContext &context,
+                          const string &db_name,
+                          const vector<vector<Value>> &source_rows,
+                          const vector<string> &source_columns,
+                          string &error_message);
 
 // Table function registration
 void RegisterIntoWzFunction(DatabaseInstance &db);
