@@ -901,58 +901,50 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
 
     // =========================================================================
-    // Step 5: Begin transaction and insert Vorlauf
+    // Steps 5-7: Transaction block (insert Vorlauf + Primanota, then commit)
+    // Uses DuckDB C++ transaction API with HasActiveTransaction() guard
     // =========================================================================
 
     auto &txn_db = DatabaseInstance::GetDatabase(context);
     Connection txn_conn(txn_db);
 
-    if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
-        AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
-        OutputResults(bind_data, global_state, output);
-        return;
+    try {
+        txn_conn.BeginTransaction();
+
+        // Step 5: Insert Vorlauf
+        auto vorlauf_start = std::chrono::high_resolution_clock::now();
+        if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
+            throw std::runtime_error(error_msg);
+        }
+        auto vorlauf_end = std::chrono::high_resolution_clock::now();
+        double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+        AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
+
+        // Step 6: Insert Primanota rows
+        auto primanota_start = std::chrono::high_resolution_clock::now();
+        int64_t total_rows = 0;
+        if (!InsertPrimanota(txn_conn, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
+            throw std::runtime_error(error_msg);
+        }
+
+        // Step 7: Commit transaction
+        txn_conn.Commit();
+
+        auto primanota_end = std::chrono::high_resolution_clock::now();
+        double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
+        AddSuccessResult(bind_data, "tblPrimanota", total_rows, vorlauf_id, primanota_duration);
+
+    } catch (const std::exception &e) {
+        if (txn_conn.HasActiveTransaction()) {
+            try {
+                txn_conn.Rollback();
+            } catch (...) {
+                // Transaction already cleaned up by DuckDB
+            }
+        }
+        bind_data.results.clear();
+        AddErrorResult(bind_data, "ERROR", e.what(), vorlauf_id);
     }
-
-    auto vorlauf_start = std::chrono::high_resolution_clock::now();
-    if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
-        string rollback_err;
-        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-        AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    auto vorlauf_end = std::chrono::high_resolution_clock::now();
-    double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-    AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
-
-    // =========================================================================
-    // Step 6: Insert Primanota rows
-    // =========================================================================
-
-    auto primanota_start = std::chrono::high_resolution_clock::now();
-    int64_t total_rows = 0;
-    if (!InsertPrimanota(txn_conn, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
-        string rollback_err;
-        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-        AddErrorResult(bind_data, "tblPrimanota", error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    // =========================================================================
-    // Step 7: Commit transaction
-    // =========================================================================
-
-    if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
-        AddErrorResult(bind_data, "ERROR", "Failed to commit transaction: " + error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    auto primanota_end = std::chrono::high_resolution_clock::now();
-    double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
-    AddSuccessResult(bind_data, "tblPrimanota", total_rows, vorlauf_id, primanota_duration);
 
     OutputResults(bind_data, global_state, output);
 }
