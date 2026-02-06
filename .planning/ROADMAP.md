@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Code Cleanup** - Remove dead code, consolidate helpers, eliminate gotos
 - [x] **Phase 2: Transaction Fix** - All-or-nothing insert guarantee with clear error messages
-- [ ] **Phase 3: Constraint Validation** - Pre-insert FK validation against MSSQL reference tables
+- [x] **Phase 3: Constraint Validation** - Pre-insert FK validation against MSSQL reference tables
 
 ## Phase Details
 
@@ -55,7 +55,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 03-01-PLAN.md -- Complete FK validation in constraint_checker.cpp and wire into IntoWzExecute pipeline
+- [x] 03-01-PLAN.md -- Complete FK validation in constraint_checker.cpp and wire into IntoWzExecute pipeline
 
 ## Progress
 
@@ -66,4 +66,4 @@ Phases execute in numeric order: 1 -> 2 -> 3
 |-------|----------------|--------|-----------|
 | 1. Code Cleanup | 2/2 | Complete | 2026-02-05 |
 | 2. Transaction Fix | 1/1 | Complete | 2026-02-06 |
-| 3. Constraint Validation | 0/1 | Not started | - |
+| 3. Constraint Validation | 1/1 | Complete | 2026-02-06 |

@@ -7,8 +7,8 @@
 
 ### Transaction Handling
 
-- [ ] **TXN-01**: All inserts (tblVorlauf + tblPrimanota) succeed or nothing is committed — all-or-nothing guarantee with attached MSSQL databases
-- [ ] **TXN-02**: When an insert fails, error message clearly states which table, which row, and the actual MSSQL error — no cryptic DuckDB internal errors like "cannot rollback - no transaction is active"
+- [x] **TXN-01**: All inserts (tblVorlauf + tblPrimanota) succeed or nothing is committed — all-or-nothing guarantee with attached MSSQL databases
+- [x] **TXN-02**: When an insert fails, error message clearly states which table, which row, and the actual MSSQL error — no cryptic DuckDB internal errors like "cannot rollback - no transaction is active"
 
 ### Code Cleanup
 
@@ -18,7 +18,7 @@
 
 ### Constraint Validation
 
-- [ ] **CST-01**: Before inserting, validate that foreign key column values in source data exist in their referenced MSSQL tables — fail early with clear message listing violating values
+- [x] **CST-01**: Before inserting, validate that foreign key column values in source data exist in their referenced MSSQL tables — fail early with clear message listing violating values
 
 ## v2 Requirements
 
@@ -40,12 +40,12 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TXN-01 | Phase 2 | Pending |
-| TXN-02 | Phase 2 | Pending |
+| TXN-01 | Phase 2 | Complete |
+| TXN-02 | Phase 2 | Complete |
 | CLN-01 | Phase 1 | Complete |
 | CLN-02 | Phase 1 | Complete |
 | CLN-03 | Phase 1 | Complete |
-| CST-01 | Phase 3 | Pending |
+| CST-01 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 6 total
@@ -54,4 +54,4 @@
 
 ---
 *Requirements defined: 2026-02-05*
-*Last updated: 2026-02-05 after Phase 1 completion*
+*Last updated: 2026-02-06 after Phase 3 completion*
