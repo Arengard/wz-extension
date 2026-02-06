@@ -720,6 +720,31 @@ static bool ValidateDuplicates(ClientContext &context,
 }
 
 // ============================================================================
+// Check if a guiVorlaufID already exists in tblVorlauf.
+// Returns true if the check succeeded. `exists` is set accordingly.
+// ============================================================================
+
+static bool VorlaufExists(Connection &conn,
+                          const string &db_name,
+                          const string &vorlauf_id,
+                          bool &exists,
+                          string &error_message) {
+    exists = false;
+    string sql = "SELECT 1 FROM " + db_name + ".dbo.tblVorlauf WHERE guiVorlaufID = '" +
+                 EscapeSqlString(vorlauf_id) + "'";
+
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+        error_message = "Failed to check existing tblVorlauf: " + result->GetError();
+        return false;
+    }
+
+    auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+    exists = materialized->Collection().Count() > 0;
+    return true;
+}
+
+// ============================================================================
 // Insert a single tblVorlauf record via the transaction connection.
 // Returns true on success, sets error_message on failure.
 // ============================================================================
@@ -864,13 +889,28 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     // BUG FIX: Use source guiVorlaufID if provided, otherwise generate UUID
     // =========================================================================
 
+    auto find_vorlauf_id_col = [&bind_data]() {
+        const vector<string> candidates = {
+            "guiVorlaufID", "gui_vorlauf_id", "guivorlaufid", "guivorlauf_id"
+        };
+        for (const auto &candidate : candidates) {
+            idx_t idx = FindColumnIndex(bind_data.source_columns, candidate);
+            if (idx != DConstants::INVALID_INDEX) {
+                return idx;
+            }
+        }
+        return DConstants::INVALID_INDEX;
+    };
+
     string vorlauf_id;
-    idx_t vorlauf_id_col = FindColumnIndex(bind_data.source_columns, "guiVorlaufID");
+    bool vorlauf_id_from_source = false;
+    idx_t vorlauf_id_col = find_vorlauf_id_col();
     if (vorlauf_id_col != DConstants::INVALID_INDEX
         && !bind_data.source_rows.empty()
         && vorlauf_id_col < bind_data.source_rows[0].size()
         && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
         vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
+        vorlauf_id_from_source = true;
     } else {
         vorlauf_id = GenerateUUID();
     }
@@ -914,18 +954,36 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         return;
     }
 
-    // Step 5: Insert Vorlauf
-    auto vorlauf_start = std::chrono::high_resolution_clock::now();
-    if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
-        string rollback_err;
-        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-        AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
-        return;
+    // Step 5: Insert Vorlauf (or reuse if already exists)
+    bool skip_vorlauf_insert = false;
+    if (vorlauf_id_from_source) {
+        bool exists = false;
+        if (!VorlaufExists(txn_conn, bind_data.secret_name, vorlauf_id, exists, error_msg)) {
+            string rollback_err;
+            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
+        skip_vorlauf_insert = exists;
     }
-    auto vorlauf_end = std::chrono::high_resolution_clock::now();
-    double vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-    AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
+
+    double vorlauf_duration = 0.0;
+    if (!skip_vorlauf_insert) {
+        auto vorlauf_start = std::chrono::high_resolution_clock::now();
+        if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
+            string rollback_err;
+            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
+        auto vorlauf_end = std::chrono::high_resolution_clock::now();
+        vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+        AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
+    } else {
+        AddSuccessResult(bind_data, "tblVorlauf", 0, vorlauf_id, 0.0);
+    }
 
     // Step 6: Insert Primanota rows
     auto primanota_start = std::chrono::high_resolution_clock::now();
