@@ -5,32 +5,33 @@
 See: .planning/PROJECT.md (updated 2026-02-05)
 
 **Core value:** Reliable, transactional import of accounting data from DuckDB into MSSQL WZ tables
-**Current focus:** Phase 2 - Transaction Fix (Phase 1 verified complete)
+**Current focus:** Phase 2 - Transaction Fix -- COMPLETE. Ready for Phase 3 (Constraint Validation).
 
 ## Current Position
 
-Phase: 1 of 3 (Code Cleanup) -- COMPLETE
-Plan: 2 of 2 in current phase
+Phase: 2 of 3 (Transaction Fix) -- COMPLETE
+Plan: 1 of 1 in current phase
 Status: Phase complete
-Last activity: 2026-02-05 -- Phase 1 verified complete (8/8 must-haves passed)
+Last activity: 2026-02-06 -- Completed 02-01-PLAN.md
 
-Progress: [█████░░░░░] 50%
+Progress: [███████░░░] 75%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: ~7 minutes
-- Total execution time: ~0.23 hours
+- Total plans completed: 3
+- Average duration: ~6 minutes
+- Total execution time: ~0.30 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-code-cleanup | 2/2 | ~14 min | ~7 min |
+| 02-transaction-fix | 1/1 | ~4 min | ~4 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (~9 min), 01-02 (~5 min)
+- Last 5 plans: 01-01 (~9 min), 01-02 (~5 min), 02-01 (~4 min)
 - Trend: improving
 
 *Updated after each plan completion*
@@ -46,6 +47,8 @@ Recent decisions affecting current work:
 - [Roadmap]: Phase 1 split into 2 plans -- dead code removal is independent from goto refactoring
 - [01-01-D1]: Inline ExtractMonthYear logic directly into DeriveVorlaufBezeichnung -- single caller, no value in separate function
 - [01-02-D1]: InsertVorlauf error message prefixed inside sub-function -- keeps error context self-contained
+- [02-01-D1]: Keep InsertVorlauf/InsertPrimanota bool-return pattern, convert to exceptions at call site with throw std::runtime_error
+- [02-01-D2]: Clear bind_data.results in catch block to prevent phantom success after rollback
 
 ### Pending Todos
 
@@ -53,10 +56,10 @@ None.
 
 ### Blockers/Concerns
 
-- DuckDB auto-manages transactions on Connection objects -- explicit BEGIN/COMMIT SQL conflicts with this. Phase 2 must find a working pattern (possibly using DuckDB's transaction API instead of raw SQL).
+- (RESOLVED) DuckDB auto-manages transactions on Connection objects -- solved by using C++ API (BeginTransaction/Commit/Rollback) with HasActiveTransaction() guard.
 
 ## Session Continuity
 
-Last session: 2026-02-05
-Stopped at: Phase 1 verified and closed. Ready for Phase 2 (Transaction Fix).
+Last session: 2026-02-06
+Stopped at: Completed 02-01-PLAN.md. Phase 2 complete. Ready for Phase 3 (Constraint Validation).
 Resume file: None

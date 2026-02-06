@@ -13,7 +13,7 @@ This roadmap delivers reliable, transactional accounting data imports by first c
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Code Cleanup** - Remove dead code, consolidate helpers, eliminate gotos
-- [ ] **Phase 2: Transaction Fix** - All-or-nothing insert guarantee with clear error messages
+- [x] **Phase 2: Transaction Fix** - All-or-nothing insert guarantee with clear error messages
 - [ ] **Phase 3: Constraint Validation** - Pre-insert FK validation against MSSQL reference tables
 
 ## Phase Details
@@ -43,7 +43,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 02-01-PLAN.md -- Replace raw SQL transaction strings with C++ API and standardize error messages
+- [x] 02-01-PLAN.md -- Replace raw SQL transaction strings with C++ API and standardize error messages
 
 ### Phase 3: Constraint Validation
 **Goal**: `into_wz` validates foreign key references against MSSQL before attempting any inserts, failing early with clear violation details
@@ -65,5 +65,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Code Cleanup | 2/2 | Complete | 2026-02-05 |
-| 2. Transaction Fix | 0/1 | Not started | - |
+| 2. Transaction Fix | 1/1 | Complete | 2026-02-06 |
 | 3. Constraint Validation | 0/1 | Not started | - |
