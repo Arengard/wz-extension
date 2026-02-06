@@ -52,10 +52,10 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. Source data with an invalid FK value (e.g., nonexistent Konto) is rejected before any INSERT executes -- zero rows written
   2. The error message lists which FK column(s) failed and which specific values do not exist in the referenced MSSQL table
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 03-01: Implement FK constraint validation against MSSQL reference tables
+- [ ] 03-01-PLAN.md -- Complete FK validation in constraint_checker.cpp and wire into IntoWzExecute pipeline
 
 ## Progress
 
