@@ -40,10 +40,10 @@ Plans:
   1. A failing insert at row N of tblPrimanota leaves zero new rows in both tblVorlauf and tblPrimanota -- nothing partially committed
   2. When an insert fails, the error message includes the target table name, the row number, and the underlying MSSQL error text
   3. The "cannot rollback - no transaction is active" error never appears -- transaction lifecycle works with attached MSSQL databases
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 02-01: Implement working transaction model for attached MSSQL databases
+- [ ] 02-01-PLAN.md -- Replace raw SQL transaction strings with C++ API and standardize error messages
 
 ### Phase 3: Constraint Validation
 **Goal**: `into_wz` validates foreign key references against MSSQL before attempting any inserts, failing early with clear violation details
