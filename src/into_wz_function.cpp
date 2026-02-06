@@ -862,6 +862,17 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     }
 
     // =========================================================================
+    // Step 3.5: Validate foreign key constraints against MSSQL reference tables
+    // =========================================================================
+
+    if (!ValidateForeignKeys(context, bind_data.secret_name,
+                             bind_data.source_rows, bind_data.source_columns, error_msg)) {
+        AddErrorResult(bind_data, "ERROR", error_msg);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    // =========================================================================
     // Step 4: Prepare Vorlauf data
     // BUG FIX: Use source guiVorlaufID if provided, otherwise generate UUID
     // =========================================================================
