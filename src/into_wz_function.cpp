@@ -756,7 +756,7 @@ static bool InsertVorlauf(Connection &txn_conn,
     );
 
     if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_message)) {
-        error_message = "Failed to insert Vorlauf: " + error_message;
+        error_message = "Failed to insert into tblVorlauf: " + error_message;
         return false;
     }
 
@@ -796,9 +796,9 @@ static bool InsertPrimanota(Connection &txn_conn,
         );
 
         if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
-            error_message = "Failed to insert tblPrimanota rows " +
+            error_message = "Failed to insert into tblPrimanota (rows " +
                 std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
-                ": " + error_message;
+                "): " + error_message;
             return false;
         }
 
