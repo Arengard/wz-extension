@@ -654,11 +654,8 @@ static void OutputResults(IntoWzBindData &bind_data,
 static bool LoadSourceData(ClientContext &context,
                            IntoWzBindData &bind_data,
                            string &error_message) {
-    auto &db = DatabaseInstance::GetDatabase(context);
-    Connection conn(db);
-
     string source_query = "SELECT * FROM " + bind_data.source_table;
-    auto source_result = conn.Query(source_query);
+    auto source_result = context.Query(source_query, false);
 
     if (source_result->HasError()) {
         error_message = "Failed to read source table: " + source_result->GetError();
