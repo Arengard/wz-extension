@@ -1,6 +1,8 @@
 #include "wz_extension.hpp"
 #include "wz_utils.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include <set>
 
 namespace duckdb {
@@ -47,10 +49,13 @@ vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
         fk_query.replace(pos, 2, table_name);
     }
 
-    // Execute via mssql_scan
+    // Execute via mssql_scan using a separate connection
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
+
     string full_query = "SELECT * FROM mssql_scan('" + secret_name + "', $$" + fk_query + "$$)";
 
-    auto result = context.Query(full_query, false);
+    auto result = conn.Query(full_query);
     if (result->HasError()) {
         // Return empty - caller should handle
         return constraints;
@@ -141,7 +146,7 @@ static idx_t FindSourceColumnForFK(const string &fk_column_name,
 // Populates missing_values with values not found in the referenced table
 // ============================================================================
 
-static void CheckValueExistence(ClientContext &context,
+static void CheckValueExistence(Connection &conn,
                                  const string &db_name,
                                  const ForeignKeyConstraint &fk,
                                  const std::set<string> &distinct_values,
@@ -166,7 +171,7 @@ static void CheckValueExistence(ClientContext &context,
                         db_name + ".dbo." + fk.referenced_table +
                         " WHERE CAST(" + fk.referenced_column + " AS VARCHAR) IN (" + in_clause + ")";
 
-        auto result = context.Query(query, false);
+        auto result = conn.Query(query);
         if (result->HasError()) {
             // Skip this constraint silently if query fails (e.g., referenced table doesn't exist)
             return;
@@ -207,6 +212,10 @@ bool ValidateForeignKeys(ClientContext &context,
         return true;  // No constraints to validate, or metadata query failed
     }
 
+    // Use a separate connection for validation queries
+    auto &db = DatabaseInstance::GetDatabase(context);
+    Connection conn(db);
+
     vector<string> violation_messages;
 
     for (auto &fk : constraints) {
@@ -235,7 +244,7 @@ bool ValidateForeignKeys(ClientContext &context,
 
         // Check which values exist in the referenced table
         vector<string> missing_values;
-        CheckValueExistence(context, db_name, fk, distinct_values, missing_values);
+        CheckValueExistence(conn, db_name, fk, distinct_values, missing_values);
 
         if (!missing_values.empty()) {
             // Format violation message: show up to 10 values
