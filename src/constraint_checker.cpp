@@ -1,8 +1,6 @@
 #include "wz_extension.hpp"
 #include "wz_utils.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/connection.hpp"
-#include "duckdb/main/database.hpp"
 #include <set>
 
 namespace duckdb {
@@ -143,7 +141,7 @@ static idx_t FindSourceColumnForFK(const string &fk_column_name,
 // Populates missing_values with values not found in the referenced table
 // ============================================================================
 
-static void CheckValueExistence(Connection &conn,
+static void CheckValueExistence(ClientContext &context,
                                  const string &db_name,
                                  const ForeignKeyConstraint &fk,
                                  const std::set<string> &distinct_values,
@@ -168,7 +166,7 @@ static void CheckValueExistence(Connection &conn,
                         db_name + ".dbo." + fk.referenced_table +
                         " WHERE CAST(" + fk.referenced_column + " AS VARCHAR) IN (" + in_clause + ")";
 
-        auto result = conn.Query(query);
+        auto result = context.Query(query, false);
         if (result->HasError()) {
             // Skip this constraint silently if query fails (e.g., referenced table doesn't exist)
             return;
@@ -209,10 +207,6 @@ bool ValidateForeignKeys(ClientContext &context,
         return true;  // No constraints to validate, or metadata query failed
     }
 
-    // Create a separate connection to avoid deadlock (same pattern as CheckDuplicates)
-    auto &db = DatabaseInstance::GetDatabase(context);
-    Connection conn(db);
-
     vector<string> violation_messages;
 
     for (auto &fk : constraints) {
@@ -241,7 +235,7 @@ bool ValidateForeignKeys(ClientContext &context,
 
         // Check which values exist in the referenced table
         vector<string> missing_values;
-        CheckValueExistence(conn, db_name, fk, distinct_values, missing_values);
+        CheckValueExistence(context, db_name, fk, distinct_values, missing_values);
 
         if (!missing_values.empty()) {
             // Format violation message: show up to 10 values

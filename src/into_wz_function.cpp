@@ -237,10 +237,6 @@ static vector<string> CheckDuplicates(ClientContext &context,
         return duplicates;
     }
 
-    // Create a new connection to avoid deadlock
-    auto &db = DatabaseInstance::GetDatabase(context);
-    Connection conn(db);
-
     // Build IN clause (batch in groups of 100 to avoid query size limits)
     for (size_t batch_start = 0; batch_start < primanota_ids.size(); batch_start += 100) {
         size_t batch_end = std::min(batch_start + 100, primanota_ids.size());
@@ -253,10 +249,10 @@ static vector<string> CheckDuplicates(ClientContext &context,
             in_clause += "'" + EscapeSqlString(primanota_ids[i]) + "'";
         }
 
-        // Query attached database directly
+        // Query attached database directly using existing context (avoid deadlock)
         string query = "SELECT CAST(guiPrimanotaID AS VARCHAR) AS id FROM " + db_name + ".dbo.tblPrimanota WHERE guiPrimanotaID IN (" + in_clause + ")";
 
-        auto result = conn.Query(query);
+        auto result = context.Query(query, false);
         if (!result->HasError()) {
             auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
             auto &collection = materialized->Collection();
@@ -497,33 +493,6 @@ static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &cont
     return unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
 }
 
-// ============================================================================
-// Helper: Execute SQL statement on attached MSSQL database
-// The db_name is the attached database name (e.g., 'mssql_conn')
-// If conn_ptr is provided, uses that connection (for transaction continuity)
-// Otherwise creates a new connection
-// ============================================================================
-
-static bool ExecuteMssqlStatementWithConn(Connection &conn,
-                                           const string &sql,
-                                           string &error_message) {
-    auto result = conn.Query(sql);
-    if (result->HasError()) {
-        error_message = result->GetError();
-        return false;
-    }
-    return true;
-}
-
-static bool ExecuteMssqlStatement(ClientContext &context,
-                                   const string &db_name,
-                                   const string &sql,
-                                   string &error_message) {
-    // Create a new connection - note: this won't maintain transaction state
-    auto &db = DatabaseInstance::GetDatabase(context);
-    Connection conn(db);
-    return ExecuteMssqlStatementWithConn(conn, sql, error_message);
-}
 
 // ============================================================================
 // Bind function
@@ -734,7 +703,7 @@ static bool ValidateDuplicates(ClientContext &context,
 // Returns true on success, sets error_message on failure.
 // ============================================================================
 
-static bool InsertVorlauf(Connection &txn_conn,
+static bool InsertVorlauf(ClientContext &context,
                           IntoWzBindData &bind_data,
                           const string &vorlauf_id,
                           const string &date_from,
@@ -752,8 +721,9 @@ static bool InsertVorlauf(Connection &txn_conn,
         bezeichnung
     );
 
-    if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_message)) {
-        error_message = "Failed to insert into tblVorlauf: " + error_message;
+    auto result = context.Query(vorlauf_sql, false);
+    if (result->HasError()) {
+        error_message = "Failed to insert into tblVorlauf: " + result->GetError();
         return false;
     }
 
@@ -765,7 +735,7 @@ static bool InsertVorlauf(Connection &txn_conn,
 // Returns true on success, sets total_rows and error_message on failure.
 // ============================================================================
 
-static bool InsertPrimanota(Connection &txn_conn,
+static bool InsertPrimanota(ClientContext &context,
                             IntoWzBindData &bind_data,
                             const string &vorlauf_id,
                             const string &date_to,
@@ -792,10 +762,11 @@ static bool InsertPrimanota(Connection &txn_conn,
             date_to
         );
 
-        if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
+        auto result = context.Query(primanota_sql, false);
+        if (result->HasError()) {
             error_message = "Failed to insert into tblPrimanota (rows " +
                 std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
-                "): " + error_message;
+                "): " + result->GetError();
             return false;
         }
 
@@ -909,19 +880,14 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
 
     // =========================================================================
-    // Steps 5-7: Transaction block (insert Vorlauf + Primanota, then commit)
-    // Uses DuckDB C++ transaction API with HasActiveTransaction() guard
+    // Steps 5-7: Insert Vorlauf + Primanota using existing context
+    // Uses context.Query() to avoid deadlock from creating a new Connection
     // =========================================================================
 
-    auto &txn_db = DatabaseInstance::GetDatabase(context);
-    Connection txn_conn(txn_db);
-
     try {
-        txn_conn.BeginTransaction();
-
         // Step 5: Insert Vorlauf
         auto vorlauf_start = std::chrono::high_resolution_clock::now();
-        if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
+        if (!InsertVorlauf(context, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
             throw std::runtime_error(error_msg);
         }
         auto vorlauf_end = std::chrono::high_resolution_clock::now();
@@ -931,25 +897,15 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         // Step 6: Insert Primanota rows
         auto primanota_start = std::chrono::high_resolution_clock::now();
         int64_t total_rows = 0;
-        if (!InsertPrimanota(txn_conn, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
+        if (!InsertPrimanota(context, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
             throw std::runtime_error(error_msg);
         }
-
-        // Step 7: Commit transaction
-        txn_conn.Commit();
 
         auto primanota_end = std::chrono::high_resolution_clock::now();
         double primanota_duration = std::chrono::duration<double>(primanota_end - primanota_start).count();
         AddSuccessResult(bind_data, "tblPrimanota", total_rows, vorlauf_id, primanota_duration);
 
     } catch (const std::exception &e) {
-        if (txn_conn.HasActiveTransaction()) {
-            try {
-                txn_conn.Rollback();
-            } catch (...) {
-                // Transaction already cleaned up by DuckDB
-            }
-        }
         bind_data.results.clear();
         AddErrorResult(bind_data, "ERROR", e.what(), vorlauf_id);
     }
