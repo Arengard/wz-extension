@@ -853,14 +853,19 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
         return true; // Nothing to derive; caller may fallback
     }
 
-    auto &chunk = collection.Chunks().front();
-    if (chunk.size() == 0) {
+    // Iterate to get the first chunk (Chunks() returns an iterator helper, not a vector)
+    DataChunk *first_chunk = nullptr;
+    for (auto &c : collection.Chunks()) {
+        first_chunk = &c;
+        break;
+    }
+    if (!first_chunk || first_chunk->size() == 0) {
         return true;
     }
 
-    string az_prefix = chunk.data[0].GetValue(0).ToString();
-    string min_date = chunk.data[2].GetValue(0).ToString();
-    string max_date = chunk.data[3].GetValue(0).ToString();
+    string az_prefix = first_chunk->data[0].GetValue(0).ToString();
+    string min_date = first_chunk->data[2].GetValue(0).ToString();
+    string max_date = first_chunk->data[3].GetValue(0).ToString();
 
     if (min_date.size() > 10) min_date = min_date.substr(0, 10);
     if (max_date.size() > 10) max_date = max_date.substr(0, 10);
