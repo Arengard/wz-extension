@@ -39,8 +39,10 @@ WHERE t.name = '%s'
 
 vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
                                                        const string &secret_name,
-                                                       const string &table_name) {
+                                                       const string &table_name,
+                                                       string &error_message) {
     vector<ForeignKeyConstraint> constraints;
+    error_message.clear();
 
     // Build the query using std::string (no snprintf buffer overflow risk)
     string fk_query = string(FK_QUERY_TEMPLATE);
@@ -57,7 +59,7 @@ vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
 
     auto result = conn.Query(full_query);
     if (result->HasError()) {
-        // Return empty - caller should handle
+        error_message = "Could not query FK constraints for " + table_name + ": " + result->GetError();
         return constraints;
     }
 
@@ -77,69 +79,7 @@ vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
     return constraints;
 }
 
-// ============================================================================
-// Helper: Escape single quotes for SQL strings
-// ============================================================================
-
-static string EscapeSqlString(const string &str) {
-    string result;
-    result.reserve(str.size() * 2);
-    for (char c : str) {
-        if (c == '\'') {
-            result += "''";
-        } else {
-            result += c;
-        }
-    }
-    return result;
-}
-
-// ============================================================================
-// Helper: Map MSSQL FK column name to source column index
-// Uses the same fallback aliases as BuildPrimanotaInsertSQL
-// Returns DConstants::INVALID_INDEX if no alias matches (skip this FK)
-// ============================================================================
-
-static idx_t FindSourceColumnForFK(const string &fk_column_name,
-                                    const vector<string> &source_columns) {
-    // Convert FK column name to lowercase for comparison
-    string fk_lower = fk_column_name;
-    std::transform(fk_lower.begin(), fk_lower.end(), fk_lower.begin(), ::tolower);
-
-    if (fk_lower == "deckontonr") {
-        // decKontoNr aliases (same as BuildPrimanotaInsertSQL)
-        const char *aliases[] = {"decKontoNr", "konto", "kontonr", "konto_nr", "account"};
-        for (const char *alias : aliases) {
-            idx_t idx = FindColumnIndex(source_columns, alias);
-            if (idx != DConstants::INVALID_INDEX) {
-                return idx;
-            }
-        }
-    } else if (fk_lower == "decgegenkontonr") {
-        // decGegenkontoNr aliases
-        const char *aliases[] = {"decGegenkontoNr", "gegenkonto", "gegenkontonr", "gegenkonto_nr", "counter_account"};
-        for (const char *alias : aliases) {
-            idx_t idx = FindColumnIndex(source_columns, alias);
-            if (idx != DConstants::INVALID_INDEX) {
-                return idx;
-            }
-        }
-    } else if (fk_lower == "deceakontonr") {
-        // decEaKontoNr aliases
-        const char *aliases[] = {"decEaKontoNr", "eakonto", "ea_konto", "eakontonr", "ea_konto_nr"};
-        for (const char *alias : aliases) {
-            idx_t idx = FindColumnIndex(source_columns, alias);
-            if (idx != DConstants::INVALID_INDEX) {
-                return idx;
-            }
-        }
-    } else {
-        // For any other FK column, try direct name match
-        return FindColumnIndex(source_columns, fk_column_name);
-    }
-
-    return DConstants::INVALID_INDEX;
-}
+// EscapeSqlString and FindColumnWithAliases are provided by wz_utils.hpp
 
 // ============================================================================
 // Helper: Check which values from a set exist in a referenced MSSQL table
@@ -207,9 +147,14 @@ bool ValidateForeignKeys(ClientContext &context,
                           const vector<string> &source_columns,
                           string &error_message) {
     // Discover FK constraints for tblPrimanota
-    auto constraints = GetForeignKeyConstraints(context, db_name, "tblPrimanota");
+    string fk_query_error;
+    auto constraints = GetForeignKeyConstraints(context, db_name, "tblPrimanota", fk_query_error);
     if (constraints.empty()) {
-        return true;  // No constraints to validate, or metadata query failed
+        if (!fk_query_error.empty()) {
+            // FK metadata query failed (e.g., permissions); skip FK validation but warn
+            error_message = "Warning: FK validation skipped - " + fk_query_error;
+        }
+        return true;
     }
 
     // Use a separate connection for validation queries
@@ -219,8 +164,8 @@ bool ValidateForeignKeys(ClientContext &context,
     vector<string> violation_messages;
 
     for (auto &fk : constraints) {
-        // Find the source column index using alias mapping
-        idx_t source_col_idx = FindSourceColumnForFK(fk.column_name, source_columns);
+        // Find the source column index using shared alias mapping (wz_utils.hpp)
+        idx_t source_col_idx = FindColumnWithAliases(source_columns, fk.column_name);
         if (source_col_idx == DConstants::INVALID_INDEX) {
             // Source doesn't have this column -- skip silently
             continue;

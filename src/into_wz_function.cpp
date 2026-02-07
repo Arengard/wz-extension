@@ -16,49 +16,8 @@
 
 namespace duckdb {
 
-// ============================================================================
-// Column name mappings from source data to tblPrimanota
-// ============================================================================
-
-struct ColumnMapping {
-    string source_name;
-    string target_name;
-    bool required;
-};
-
-// Note: These mappings define alternative column names
-// The actual column lookup happens in BuildPrimanotaInsertSQL with fallback logic
-static const vector<ColumnMapping> PRIMANOTA_COLUMN_MAPPINGS = {
-    // Primary column names
-    {"guiPrimanotaID", "guiPrimanotaID", true},
-    {"dtmBelegDatum", "dtmBelegDatum", true},
-    {"decKontoNr", "decKontoNr", true},
-    {"decGegenkontoNr", "decGegenkontoNr", true},
-    {"decEaKontoNr", "decEaKontoNr", false},
-    {"ysnSoll", "ysnSoll", true},
-    {"curEingabeBetrag", "curEingabeBetrag", true},
-    {"curBasisBetrag", "curBasisBetrag", false},
-    {"strBeleg1", "strBeleg1", false},
-    {"strBeleg2", "strBeleg2", false},
-    {"strBuchText", "strBuchText", false},
-    // Alternative names (common in source data)
-    {"konto", "decKontoNr", false},              // konto -> decKontoNr
-    {"gegenkonto", "decGegenkontoNr", false},    // gegenkonto -> decGegenkontoNr
-    {"eakonto", "decEaKontoNr", false},          // eakonto -> decEaKontoNr
-    {"ea_konto", "decEaKontoNr", false},         // ea_konto -> decEaKontoNr
-    {"umsatz", "curEingabeBetrag", false},       // umsatz -> curEingabeBetrag
-    {"betrag", "curEingabeBetrag", false},       // betrag -> curEingabeBetrag
-    {"umsatz_mit_vorzeichen", "curBasisBetrag", false},
-    {"sh", "ysnSoll", false},                    // sh (Soll/Haben) -> ysnSoll
-    {"soll_haben", "ysnSoll", false},            // soll_haben -> ysnSoll
-    {"strbuchtext", "strBuchText", false},
-    {"buchungstext", "strBuchText", false},
-    {"text", "strBuchText", false},
-    {"beleg1", "strBeleg1", false},
-    {"beleg2", "strBeleg2", false},
-    {"belegdatum", "dtmBelegDatum", false},
-    {"datum", "dtmBelegDatum", false},
-};
+// Column alias mappings are defined in wz_utils.hpp (FindColumnWithAliases)
+// as a single source of truth shared with constraint_checker.cpp.
 
 // ============================================================================
 // Helper: Parse Soll/Haben string to boolean
@@ -182,7 +141,7 @@ static string GenerateUUIDv5(const string &row_key) {
 }
 
 // Build a deterministic row key from row values for UUID generation
-static string BuildRowKey(const vector<Value> &row, const vector<string> &columns) {
+static string BuildRowKey(const vector<Value> &row) {
     std::ostringstream key;
     for (size_t i = 0; i < row.size(); i++) {
         if (i > 0) key << "|";
@@ -193,46 +152,25 @@ static string BuildRowKey(const vector<Value> &row, const vector<string> &column
     return key.str();
 }
 
-// Generate deterministic UUID for a row (backward compatible wrapper)
-static string GenerateUUID() {
-    // Fallback: generate random UUID when no row context available
-    return UUID::ToString(UUID::GenerateRandomUUID());
-}
-
 // Generate deterministic UUID v5 for a specific row
-static string GenerateRowUUID(const vector<Value> &row, const vector<string> &columns) {
-    string row_key = BuildRowKey(row, columns);
+static string GenerateRowUUID(const vector<Value> &row) {
+    string row_key = BuildRowKey(row);
     return GenerateUUIDv5(row_key);
 }
 
 // Generate deterministic UUID v5 for Vorlauf based on all source rows
-static string GenerateVorlaufUUID(const vector<vector<Value>> &rows, const vector<string> &columns,
+static string GenerateVorlaufUUID(const vector<vector<Value>> &rows,
                                    const string &gui_verfahren_id) {
     std::ostringstream combined_key;
     combined_key << "vorlauf:" << gui_verfahren_id << ":";
     for (size_t r = 0; r < rows.size(); r++) {
         if (r > 0) combined_key << "||";
-        combined_key << BuildRowKey(rows[r], columns);
+        combined_key << BuildRowKey(rows[r]);
     }
     return GenerateUUIDv5(combined_key.str());
 }
 
-// ============================================================================
-// Helper: Escape SQL string for MSSQL
-// ============================================================================
-
-static string EscapeSqlString(const string &str) {
-    string result;
-    result.reserve(str.size() * 2);
-    for (char c : str) {
-        if (c == '\'') {
-            result += "''";
-        } else {
-            result += c;
-        }
-    }
-    return result;
-}
+// EscapeSqlString is provided by wz_utils.hpp
 
 // ============================================================================
 // Helper: Format value for SQL INSERT
@@ -267,15 +205,8 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
                                            const vector<string> &columns) {
     string min_date, max_date;
 
-    // Look for dtmBelegDatum column
-    idx_t date_col = FindColumnIndex(columns, "dtmBelegDatum");
-    if (date_col == DConstants::INVALID_INDEX) {
-        // Try alternative names
-        date_col = FindColumnIndex(columns, "belegdatum");
-        if (date_col == DConstants::INVALID_INDEX) {
-            date_col = FindColumnIndex(columns, "datum");
-        }
-    }
+    // Look for dtmBelegDatum column (tries aliases: belegdatum, datum, date)
+    idx_t date_col = FindColumnWithAliases(columns, "dtmBelegDatum");
 
     if (date_col == DConstants::INVALID_INDEX) {
         return {"", ""};
@@ -407,62 +338,18 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
 
     string timestamp = GetCurrentTimestamp();
 
-    // Helper lambda to find column with fallback names
-    auto findColumnWithFallbacks = [&columns](std::initializer_list<const char*> names) -> idx_t {
-        for (const char* name : names) {
-            idx_t idx = FindColumnIndex(columns, name);
-            if (idx != DConstants::INVALID_INDEX) {
-                return idx;
-            }
-        }
-        return DConstants::INVALID_INDEX;
-    };
-
-    // Find column indices with fallback alternative names
+    // Find column indices using shared alias definitions (single source of truth in wz_utils.hpp)
     idx_t col_primanota_id = FindColumnIndex(columns, "guiPrimanotaID");
-
-    idx_t col_beleg_datum = findColumnWithFallbacks({
-        "dtmBelegDatum", "belegdatum", "datum", "date"
-    });
-
-    idx_t col_konto_nr = findColumnWithFallbacks({
-        "decKontoNr", "konto", "kontonr", "konto_nr", "account"
-    });
-
-    idx_t col_gegenkonto_nr = findColumnWithFallbacks({
-        "decGegenkontoNr", "gegenkonto", "gegenkontonr", "gegenkonto_nr", "counter_account"
-    });
-
-    idx_t col_ea_konto_nr = findColumnWithFallbacks({
-        "decEaKontoNr", "eakonto", "ea_konto", "eakontonr", "ea_konto_nr"
-    });
-
-    // ysnSoll can come from ysnSoll (boolean) or sh (Soll/Haben string)
-    idx_t col_ysn_soll = findColumnWithFallbacks({
-        "ysnSoll", "ysnsoll", "soll", "sh", "soll_haben", "sollhaben"
-    });
-
-    idx_t col_eingabe_betrag = findColumnWithFallbacks({
-        "curEingabeBetrag", "umsatz", "betrag", "amount", "eingabebetrag"
-    });
-
-    idx_t col_basis_betrag = findColumnWithFallbacks({
-        "curBasisBetrag", "umsatz_mit_vorzeichen", "basisbetrag", "basis_betrag"
-    });
-
-    idx_t col_beleg1 = findColumnWithFallbacks({
-        "strBeleg1", "beleg1", "beleg_1", "belegfeld1", "belegfeld_1",
-        "belegnr", "belegnummer", "beleg_nr", "beleg_nummer"
-    });
-
-    idx_t col_beleg2 = findColumnWithFallbacks({
-        "strBeleg2", "beleg2", "beleg_2", "belegfeld2", "belegfeld_2",
-        "trans_nr", "transnr", "trans_nummer", "transaktionsnr"
-    });
-
-    idx_t col_buch_text = findColumnWithFallbacks({
-        "strBuchText", "strbuchtext", "buchungstext", "buchtext", "text", "description"
-    });
+    idx_t col_beleg_datum = FindColumnWithAliases(columns, "dtmBelegDatum");
+    idx_t col_konto_nr = FindColumnWithAliases(columns, "decKontoNr");
+    idx_t col_gegenkonto_nr = FindColumnWithAliases(columns, "decGegenkontoNr");
+    idx_t col_ea_konto_nr = FindColumnWithAliases(columns, "decEaKontoNr");
+    idx_t col_ysn_soll = FindColumnWithAliases(columns, "ysnSoll");
+    idx_t col_eingabe_betrag = FindColumnWithAliases(columns, "curEingabeBetrag");
+    idx_t col_basis_betrag = FindColumnWithAliases(columns, "curBasisBetrag");
+    idx_t col_beleg1 = FindColumnWithAliases(columns, "strBeleg1");
+    idx_t col_beleg2 = FindColumnWithAliases(columns, "strBeleg2");
+    idx_t col_buch_text = FindColumnWithAliases(columns, "strBuchText");
 
     std::ostringstream sql;
     sql << "INSERT INTO " << db_name << ".dbo.tblPrimanota (";
@@ -494,7 +381,7 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
             return row[idx];
         };
 
-        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateRowUUID(row, columns) : getValue(col_primanota_id).ToString();
+        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateRowUUID(row) : getValue(col_primanota_id).ToString();
         string beleg_datum = getValue(col_beleg_datum).IsNull() ? timestamp.substr(0, 10) : getValue(col_beleg_datum).ToString();
         if (beleg_datum.length() > 10) {
             beleg_datum = beleg_datum.substr(0, 10);
@@ -560,20 +447,6 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
     return sql.str();
 }
 
-// ============================================================================
-// Helper: Execute SQL via mssql_query (for queries that return data)
-// ============================================================================
-
-static unique_ptr<MaterializedQueryResult> ExecuteMssqlQuery(ClientContext &context,
-                                                              const string &secret_name,
-                                                              const string &sql) {
-    string query = "SELECT * FROM mssql_query('" + secret_name + "', $$" + sql + "$$)";
-    auto result = context.Query(query, false);
-    if (result->HasError()) {
-        return nullptr;
-    }
-    return unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
-}
 
 // ============================================================================
 // Helper: Execute SQL statement via a Connection (for transaction continuity)
@@ -600,6 +473,10 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
                                             vector<string> &names) {
     auto bind_data = make_uniq<IntoWzBindData>();
 
+    // Set defaults (overridden by parsed parameters below)
+    bind_data->generate_vorlauf_id = true;
+    bind_data->lng_kanzlei_konten_rahmen_id = 0;
+
     // Parse named parameters
     for (auto &kv : input.named_parameters) {
         if (kv.first == "secret") {
@@ -624,7 +501,6 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
     if (bind_data->str_angelegt.empty()) {
         bind_data->str_angelegt = "wz_extension";
     }
-    bind_data->generate_vorlauf_id = true;
     bind_data->executed = false;
     bind_data->current_result_idx = 0;
 
@@ -865,12 +741,7 @@ static bool UpdateVorlauf(Connection &txn_conn,
                           const string &bezeichnung,
                           const string &str_angelegt,
                           string &error_message) {
-    // Get current timestamp
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    char timestamp_buf[32];
-    std::strftime(timestamp_buf, sizeof(timestamp_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
-    string timestamp(timestamp_buf);
+    string timestamp = GetCurrentTimestamp();
 
     std::ostringstream sql;
     sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET ";
@@ -1029,6 +900,18 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         return;
     }
 
+    if (bind_data.lng_kanzlei_konten_rahmen_id <= 0) {
+        AddErrorResult(bind_data, "ERROR", "lng_kanzlei_konten_rahmen_id is required and must be positive");
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    if (!IsValidSqlIdentifier(bind_data.secret_name)) {
+        AddErrorResult(bind_data, "ERROR", "Invalid secret name: must contain only alphanumeric characters, underscores, and dots");
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
     // =========================================================================
     // Step 2: Load source data from DuckDB table
     // =========================================================================
@@ -1060,6 +943,18 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         OutputResults(bind_data, global_state, output);
         return;
     }
+    // Propagate FK validation warning (e.g., could not query constraints) as informational row
+    if (!error_msg.empty()) {
+        InsertResult warning;
+        warning.table_name = "FK_VALIDATION";
+        warning.rows_inserted = 0;
+        warning.gui_vorlauf_id = "";
+        warning.duration_seconds = 0;
+        warning.success = true;
+        warning.error_message = error_msg;
+        bind_data.results.push_back(warning);
+        error_msg.clear();
+    }
 
     // =========================================================================
     // Step 4: Prepare Vorlauf data
@@ -1090,7 +985,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         vorlauf_id_from_source = true;
     } else {
         // Generate deterministic UUID v5 based on all source rows and verfahren_id
-        vorlauf_id = GenerateVorlaufUUID(bind_data.source_rows, bind_data.source_columns,
+        vorlauf_id = GenerateVorlaufUUID(bind_data.source_rows,
                                           bind_data.gui_verfahren_id);
     }
 
@@ -1099,20 +994,10 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     string date_to = date_range.second;
 
     if (date_from.empty()) {
-        // Default to current month
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        char buffer[32];
-        std::strftime(buffer, sizeof(buffer), "%Y-%m-01", std::localtime(&time));
-        date_from = string(buffer);
+        date_from = GetCurrentMonthStart();
     }
     if (date_to.empty()) {
-        // Default to current date
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        char buffer[32];
-        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", std::localtime(&time));
-        date_to = string(buffer);
+        date_to = GetCurrentDate();
     }
 
     string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);

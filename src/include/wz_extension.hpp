@@ -58,7 +58,8 @@ struct InsertResult {
 // Constraint checker functions
 vector<ForeignKeyConstraint> GetForeignKeyConstraints(ClientContext &context,
                                                        const string &secret_name,
-                                                       const string &table_name);
+                                                       const string &table_name,
+                                                       string &error_message);
 
 bool ValidateForeignKeys(ClientContext &context,
                           const string &db_name,

@@ -406,12 +406,11 @@ make clean
 wz-extension/
 ├── src/
 │   ├── include/
-│   │   └── wz_extension.hpp      # Headers and structs
+│   │   ├── wz_extension.hpp      # Headers and structs
+│   │   └── wz_utils.hpp          # Shared utilities (column aliases, SQL helpers)
 │   ├── wz_extension.cpp          # Extension entry point
 │   ├── into_wz_function.cpp      # Main function implementation
-│   ├── constraint_checker.cpp    # FK constraint validation
-│   ├── vorlauf_builder.cpp       # Vorlauf record builder
-│   └── primanota_mapper.cpp      # Primanota data mapper
+│   └── constraint_checker.cpp    # FK constraint validation
 ├── duckdb/                       # DuckDB submodule
 ├── extension-ci-tools/           # Build infrastructure
 ├── CMakeLists.txt
