@@ -839,7 +839,7 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
         " WHERE tblPrimanota.guiVerfahrenID = '" + EscapeSqlString(gui_verfahren_id) + "'"
         " GROUP BY tblVerfahren.strAZGericht"
         ")"
-        " SELECT 'az - ' + LEFT(RIGHT(strAZGericht, 6), 3) AS x, strAZGericht, minBelegdatum, maxBelegdatum FROM data";
+        " SELECT 'az - ' || LEFT(RIGHT(strAZGericht, 6), 3) AS x, strAZGericht, minBelegdatum, maxBelegdatum FROM data";
 
     auto result = conn.Query(sql);
     if (result->HasError()) {
