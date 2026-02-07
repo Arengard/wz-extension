@@ -877,25 +877,25 @@ static bool InsertPrimanota(Connection &txn_conn,
 }
 
 // ============================================================================
-// Helper: Derive strBezeichnung from MSSQL data
+// Helper: Derive strBezeichnung from MSSQL tblVerfahren data
+// Uses the provided date range (from source data) and fetches strAZGericht from tblVerfahren.
 // Returns true on success; leaves `bezeichnung` empty if no data; sets error_message on failure.
 // ============================================================================
 
 static bool DeriveBezeichnungFromMssql(Connection &conn,
                                        const string &db_name,
                                        const string &gui_verfahren_id,
+                                       const string &date_from,
+                                       const string &date_to,
                                        string &bezeichnung,
                                        string &error_message) {
     bezeichnung.clear();
+
+    // Query tblVerfahren directly for strAZGericht - no need to check existing Primanota
     string sql =
-        "WITH data AS ("
-        " SELECT MIN(dtmBelegDatum) AS minBelegdatum, MAX(dtmBelegDatum) AS maxBelegdatum, tblVerfahren.strAZGericht"
-        " FROM " + db_name + ".dbo.tblPrimanota"
-        " INNER JOIN " + db_name + ".dbo.tblVerfahren ON tblVerfahren.guiVerfahrenID = tblPrimanota.guiVerfahrenID"
-        " WHERE tblPrimanota.guiVerfahrenID = '" + EscapeSqlString(gui_verfahren_id) + "'"
-        " GROUP BY tblVerfahren.strAZGericht"
-        ")"
-        " SELECT 'az - ' || LEFT(RIGHT(strAZGericht, 6), 3) AS x, strAZGericht, minBelegdatum, maxBelegdatum FROM data";
+        "SELECT 'az - ' + LEFT(RIGHT(strAZGericht, 6), 3) AS az_prefix, strAZGericht"
+        " FROM " + db_name + ".dbo.tblVerfahren"
+        " WHERE guiVerfahrenID = '" + EscapeSqlString(gui_verfahren_id) + "'";
 
     auto result = conn.Query(sql);
     if (result->HasError()) {
@@ -906,7 +906,7 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
     auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
     auto &collection = materialized->Collection();
     if (collection.Count() == 0) {
-        return true; // Nothing to derive; caller may fallback
+        return true; // No Verfahren found; caller may fallback
     }
 
     // Use Fetch() to get a chunk safely
@@ -916,22 +916,22 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
     }
 
     // Verify we have enough columns
-    if (chunk->ColumnCount() < 4) {
+    if (chunk->ColumnCount() < 2) {
         return true;
     }
 
     // Check for null values before accessing
     Value az_val = chunk->data[0].GetValue(0);
-    Value min_val = chunk->data[2].GetValue(0);
-    Value max_val = chunk->data[3].GetValue(0);
 
     if (az_val.IsNull()) {
         return true;
     }
 
     string az_prefix = az_val.ToString();
-    string min_date = min_val.IsNull() ? "" : min_val.ToString();
-    string max_date = max_val.IsNull() ? "" : max_val.ToString();
+
+    // Use the provided date range from source data
+    string min_date = date_from;
+    string max_date = date_to;
 
     if (min_date.size() > 10) min_date = min_date.substr(0, 10);
     if (max_date.size() > 10) max_date = max_date.substr(0, 10);
@@ -1092,7 +1092,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     }
 
     string derived_bezeichnung;
-    if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id, derived_bezeichnung, error_msg)) {
+    if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id, date_from, date_to, derived_bezeichnung, error_msg)) {
         RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
         return;
     }
