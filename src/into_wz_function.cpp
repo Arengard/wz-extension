@@ -853,19 +853,29 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
         return true; // Nothing to derive; caller may fallback
     }
 
-    // Iterate to get the first chunk (Chunks() returns an iterator helper, not a vector)
-    DataChunk *first_chunk = nullptr;
-    for (auto &c : collection.Chunks()) {
-        first_chunk = &c;
-        break;
-    }
-    if (!first_chunk || first_chunk->size() == 0) {
+    // Use Fetch() to get a chunk safely
+    auto chunk = materialized->Fetch();
+    if (!chunk || chunk->size() == 0) {
         return true;
     }
 
-    string az_prefix = first_chunk->data[0].GetValue(0).ToString();
-    string min_date = first_chunk->data[2].GetValue(0).ToString();
-    string max_date = first_chunk->data[3].GetValue(0).ToString();
+    // Verify we have enough columns
+    if (chunk->ColumnCount() < 4) {
+        return true;
+    }
+
+    // Check for null values before accessing
+    Value az_val = chunk->data[0].GetValue(0);
+    Value min_val = chunk->data[2].GetValue(0);
+    Value max_val = chunk->data[3].GetValue(0);
+
+    if (az_val.IsNull()) {
+        return true;
+    }
+
+    string az_prefix = az_val.ToString();
+    string min_date = min_val.IsNull() ? "" : min_val.ToString();
+    string max_date = max_val.IsNull() ? "" : max_val.ToString();
 
     if (min_date.size() > 10) min_date = min_date.substr(0, 10);
     if (max_date.size() > 10) max_date = max_date.substr(0, 10);
