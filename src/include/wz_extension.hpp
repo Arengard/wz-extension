@@ -28,16 +28,6 @@ struct ForeignKeyConstraint {
     string referenced_column;
 };
 
-struct ConstraintViolation {
-    string constraint_name;
-    string table_name;
-    string column_name;
-    string referenced_table;
-    string referenced_column;
-    vector<string> violating_values;
-    vector<string> violating_row_ids;
-};
-
 // ============================================================================
 // Insert result
 // ============================================================================

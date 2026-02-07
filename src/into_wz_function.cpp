@@ -9,7 +9,6 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
-#include "yyjson.hpp"
 #include "mbedtls_wrapper.hpp"
 #include <chrono>
 #include <sstream>
@@ -71,14 +70,12 @@ struct IntoWzBindData : public TableFunctionData {
 
     // Source data column info
     vector<string> source_columns;
-    vector<LogicalType> source_types;
 
     // Collected source data
     vector<vector<Value>> source_rows;
 
     // Results to return
     vector<InsertResult> results;
-    idx_t current_result_idx;
     bool executed;
 };
 
@@ -112,14 +109,13 @@ static string GenerateUUIDv5(const string &row_key) {
     // Add the row key
     sha1.AddString(row_key);
 
-    // Get the SHA-1 hash (20 bytes as hex string = 40 chars)
-    string hash_hex = sha1.Finalize();
+    // Get the SHA-1 hash (20 raw bytes)
+    string hash = sha1.Finalize();
 
-    // Convert hex string to bytes (we need first 16 bytes = 32 hex chars)
+    // Copy first 16 bytes of hash to uuid_bytes
     uint8_t uuid_bytes[16];
     for (int i = 0; i < 16; i++) {
-        char hex[3] = { hash_hex[i * 2], hash_hex[i * 2 + 1], '\0' };
-        uuid_bytes[i] = static_cast<uint8_t>(strtol(hex, nullptr, 16));
+        uuid_bytes[i] = static_cast<uint8_t>(hash[i]);
     }
 
     // Set version to 5 (bits 4-7 of byte 6)
@@ -502,7 +498,6 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
         bind_data->str_angelegt = "wz_extension";
     }
     bind_data->executed = false;
-    bind_data->current_result_idx = 0;
 
     // Define return columns
     names = {"table_name", "rows_inserted", "gui_vorlauf_id", "duration_seconds", "success", "error_message"};
@@ -608,10 +603,9 @@ static bool LoadSourceData(ClientContext &context,
 
     auto source_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(source_result));
 
-    // Get column names and types
+    // Get column names
     for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
         bind_data.source_columns.push_back(source_materialized->ColumnName(i));
-        bind_data.source_types.push_back(source_materialized->types[i]);
     }
 
     // Collect all rows
@@ -882,7 +876,6 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         return;
     }
     bind_data.executed = true;
-    auto start_time = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
     // Step 1: Validate required parameters
