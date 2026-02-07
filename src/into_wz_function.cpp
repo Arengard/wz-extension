@@ -821,6 +821,55 @@ static bool InsertPrimanota(Connection &txn_conn,
 }
 
 // ============================================================================
+// Helper: Derive strBezeichnung from MSSQL data
+// Returns true on success; leaves `bezeichnung` empty if no data; sets error_message on failure.
+// ============================================================================
+
+static bool DeriveBezeichnungFromMssql(Connection &conn,
+                                       const string &db_name,
+                                       const string &gui_verfahren_id,
+                                       string &bezeichnung,
+                                       string &error_message) {
+    bezeichnung.clear();
+    string sql =
+        "WITH data AS ("
+        " SELECT MIN(dtmBelegDatum) AS minBelegdatum, MAX(dtmBelegDatum) AS maxBelegdatum, tblVerfahren.strAZGericht"
+        " FROM " + db_name + ".dbo.tblPrimanota"
+        " INNER JOIN " + db_name + ".dbo.tblVerfahren ON tblVerfahren.guiVerfahrenID = tblPrimanota.guiVerfahrenID"
+        " WHERE tblPrimanota.guiVerfahrenID = '" + EscapeSqlString(gui_verfahren_id) + "'"
+        " GROUP BY tblVerfahren.strAZGericht"
+        ")"
+        " SELECT 'az - ' + LEFT(RIGHT(strAZGericht, 6), 3) AS x, strAZGericht, minBelegdatum, maxBelegdatum FROM data";
+
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+        error_message = "Failed to derive strBezeichnung: " + result->GetError();
+        return false;
+    }
+
+    auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+    auto &collection = materialized->Collection();
+    if (collection.Count() == 0) {
+        return true; // Nothing to derive; caller may fallback
+    }
+
+    auto &chunk = collection.Chunks().front();
+    if (chunk.size() == 0) {
+        return true;
+    }
+
+    string az_prefix = chunk.data[0].GetValue(0).ToString();
+    string min_date = chunk.data[2].GetValue(0).ToString();
+    string max_date = chunk.data[3].GetValue(0).ToString();
+
+    if (min_date.size() > 10) min_date = min_date.substr(0, 10);
+    if (max_date.size() > 10) max_date = max_date.substr(0, 10);
+
+    bezeichnung = az_prefix + " " + min_date + " - " + max_date;
+    return true;
+}
+
+// ============================================================================
 // Main execution function
 // ============================================================================
 
@@ -952,6 +1001,18 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
         OutputResults(bind_data, global_state, output);
         return;
+    }
+
+    string derived_bezeichnung;
+    if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id, derived_bezeichnung, error_msg)) {
+        string rollback_err;
+        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+        AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+    if (!derived_bezeichnung.empty()) {
+        bezeichnung = std::move(derived_bezeichnung);
     }
 
     // Step 5: Insert Vorlauf (or reuse if already exists)
