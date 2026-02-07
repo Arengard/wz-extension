@@ -11,9 +11,18 @@
 #include "duckdb/main/connection.hpp"
 #include "mbedtls_wrapper.hpp"
 #include <chrono>
+#include <iterator>
 #include <sstream>
 
 namespace duckdb {
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+static constexpr size_t PRIMANOTA_BATCH_SIZE = 100;
+static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 100;
+static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
 
 // Column alias mappings are defined in wz_utils.hpp (FindColumnWithAliases)
 // as a single source of truth shared with constraint_checker.cpp.
@@ -166,6 +175,42 @@ static string GenerateVorlaufUUID(const vector<vector<Value>> &rows,
     return GenerateUUIDv5(combined_key.str());
 }
 
+// ============================================================================
+// Helper: Validate UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+// ============================================================================
+
+static bool IsValidUuidFormat(const string &str) {
+    if (str.length() != 36) {
+        return false;
+    }
+    for (size_t i = 0; i < str.length(); i++) {
+        char c = str[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else {
+            if (!isxdigit(static_cast<unsigned char>(c))) return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Helper: Find guiVorlaufID column index with common aliases
+// ============================================================================
+
+static idx_t FindVorlaufIdColumn(const vector<string> &columns) {
+    static const vector<string> candidates = {
+        "guiVorlaufID", "gui_vorlauf_id", "guivorlaufid", "guivorlauf_id"
+    };
+    for (const auto &candidate : candidates) {
+        idx_t idx = FindColumnIndex(columns, candidate);
+        if (idx != DConstants::INVALID_INDEX) {
+            return idx;
+        }
+    }
+    return DConstants::INVALID_INDEX;;
+}
+
 // EscapeSqlString is provided by wz_utils.hpp
 
 // ============================================================================
@@ -185,11 +230,24 @@ static string FormatSqlValue(const Value &val) {
             return val.GetValue<bool>() ? "1" : "0";
         case LogicalTypeId::DATE:
         case LogicalTypeId::TIMESTAMP:
-            return "'" + val.ToString() + "'";
         case LogicalTypeId::UUID:
-            return "'" + val.ToString() + "'";
+            return "'" + EscapeSqlString(val.ToString()) + "'";
         default:
-            return val.ToString();
+            // Numeric types - validate they don't contain SQL injection
+            {
+                string str = val.ToString();
+                // For numeric types, ensure it's actually numeric (defense in depth)
+                bool is_numeric = !str.empty() && (str[0] == '-' || str[0] == '.' || isdigit(str[0]));
+                for (size_t i = 1; i < str.size() && is_numeric; i++) {
+                    char c = str[i];
+                    is_numeric = isdigit(c) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-';
+                }
+                if (is_numeric) {
+                    return str;
+                }
+                // Fallback to escaped string if not purely numeric
+                return "'" + EscapeSqlString(str) + "'";
+            }
     }
 }
 
@@ -246,9 +304,9 @@ static vector<string> CheckDuplicates(ClientContext &context,
     auto &db = DatabaseInstance::GetDatabase(context);
     Connection conn(db);
 
-    // Build IN clause (batch in groups of 100 to avoid query size limits)
-    for (size_t batch_start = 0; batch_start < primanota_ids.size(); batch_start += 100) {
-        size_t batch_end = std::min(batch_start + 100, primanota_ids.size());
+    // Build IN clause (batch in groups to avoid query size limits)
+    for (size_t batch_start = 0; batch_start < primanota_ids.size(); batch_start += DUPLICATE_CHECK_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + DUPLICATE_CHECK_BATCH_SIZE, primanota_ids.size());
 
         string in_clause;
         for (size_t i = batch_start; i < batch_end; i++) {
@@ -302,12 +360,12 @@ static string BuildVorlaufInsertSQL(const string &db_name,
     sql << "'" << timestamp << "', ";  // dtmAngelegt
     sql << "NULL, ";  // strGeaendert
     sql << "NULL, ";  // dtmGeaendert
-    sql << "'" << vorlauf_id << "', ";  // guiVorlaufID
-    sql << "'" << verfahren_id << "', ";  // guiVerfahrenID
+    sql << "'" << EscapeSqlString(vorlauf_id) << "', ";  // guiVorlaufID
+    sql << "'" << EscapeSqlString(verfahren_id) << "', ";  // guiVerfahrenID
     sql << konten_rahmen_id << ", ";  // lngKanzleiKontenRahmenID
     sql << "1, ";  // lngStatus
-    sql << "'" << date_to << " 00:00:00', ";  // dtmVorlaufDatumBis
-    sql << "'" << date_from << " 00:00:00', ";  // dtmVorlaufDatumVon
+    sql << "'" << EscapeSqlString(date_to) << " 00:00:00', ";  // dtmVorlaufDatumBis
+    sql << "'" << EscapeSqlString(date_from) << " 00:00:00', ";  // dtmVorlaufDatumVon
     sql << "NULL, ";  // lngVorlaufNr
     sql << "'" << EscapeSqlString(bezeichnung) << "', ";  // strBezeichnung
     sql << "NULL, ";  // dtmDatevExport
@@ -318,17 +376,18 @@ static string BuildVorlaufInsertSQL(const string &db_name,
 }
 
 // ============================================================================
-// Helper: Build Primanota INSERT SQL for a batch of rows
+// Helper: Build Primanota INSERT SQL for a batch of rows (using iterators to avoid copying)
 // ============================================================================
 
 static string BuildPrimanotaInsertSQL(const string &db_name,
-                                       const vector<vector<Value>> &rows,
+                                       vector<vector<Value>>::const_iterator rows_begin,
+                                       vector<vector<Value>>::const_iterator rows_end,
                                        const vector<string> &columns,
                                        const string &vorlauf_id,
                                        const string &verfahren_id,
                                        const string &str_angelegt,
                                        const string &vorlauf_datum_bis) {
-    if (rows.empty()) {
+    if (rows_begin == rows_end) {
         return "";
     }
 
@@ -362,12 +421,14 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
     sql << "ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz";
     sql << ") VALUES\n";
 
-    for (size_t i = 0; i < rows.size(); i++) {
-        const auto &row = rows[i];
+    bool first = true;
+    for (auto it = rows_begin; it != rows_end; ++it) {
+        const auto &row = *it;
 
-        if (i > 0) {
+        if (!first) {
             sql << ",\n";
         }
+        first = false;
 
         // Get values from row with safe access
         auto getValue = [&row](idx_t idx) -> Value {
@@ -407,7 +468,7 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
         sql << "NULL, ";  // strGeaendert
         sql << "NULL, ";  // dtmGeaendert
         sql << "'" << EscapeSqlString(primanota_id) << "', ";  // guiPrimanotaID
-        sql << "'" << vorlauf_id << "', ";  // guiVorlaufID
+        sql << "'" << EscapeSqlString(vorlauf_id) << "', ";  // guiVorlaufID
         sql << "1, ";  // lngStatus
         sql << "NULL, ";  // lngZeilenNr
         sql << "1, ";  // lngEingabeWaehrungID (EUR)
@@ -415,8 +476,8 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
         sql << FormatSqlValue(gegenkonto_val) << ", ";  // decGegenkontoNr
         sql << FormatSqlValue(konto_val) << ", ";  // decKontoNr
         sql << FormatSqlValue(ea_konto_val) << ", ";  // decEaKontoNr
-        sql << "'" << vorlauf_datum_bis << " 00:00:00', ";  // dtmVorlaufDatumBis
-        sql << "'" << beleg_datum << "', ";  // dtmBelegDatum
+        sql << "'" << EscapeSqlString(vorlauf_datum_bis) << " 00:00:00', ";  // dtmVorlaufDatumBis
+        sql << "'" << EscapeSqlString(beleg_datum) << "', ";  // dtmBelegDatum
         sql << (is_soll ? "1" : "0") << ", ";  // ysnSoll (parsed from sh/Soll/Haben)
         sql << FormatSqlValue(eingabe_betrag_val) << ", ";  // curEingabeBetrag
         sql << FormatSqlValue(basis_betrag_val) << ", ";  // curBasisBetrag
@@ -430,7 +491,7 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
         sql << "NULL, NULL, ";  // strKost1, strKost2
         sql << "NULL, NULL, ";  // strEuLand, strUstId
         sql << "NULL, NULL, ";  // decEuSteuersatz, dtmZusatzDatum
-        sql << "'" << verfahren_id << "', ";  // guiVerfahrenID
+        sql << "'" << EscapeSqlString(verfahren_id) << "', ";  // guiVerfahrenID
         sql << "NULL, ";  // decEaSteuersatz
         sql << "0, ";  // ysnEaTransaktionenManuell
         sql << "NULL, NULL, NULL, ";  // decEaNummer, lngSachverhalt13b, dtmLeistung
@@ -510,7 +571,7 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
         LogicalType::VARCHAR    // error_message
     };
 
-    return std::move(bind_data);
+    return bind_data;
 }
 
 // ============================================================================
@@ -554,6 +615,7 @@ static void AddSuccessResult(IntoWzBindData &bind_data, const string &table_name
     bind_data.results.push_back(result);
 }
 
+
 // ============================================================================
 // Output accumulated results from bind_data to the DataChunk.
 // Handles pagination: picks up from global_state.current_idx.
@@ -583,7 +645,21 @@ static void OutputResults(IntoWzBindData &bind_data,
 }
 
 // ============================================================================
-// Read source table into bind_data.source_columns, source_types, and source_rows.
+// Helper: Rollback transaction and add error result (reduces repetitive pattern)
+// ============================================================================
+
+static void RollbackAndError(Connection &txn_conn, IntoWzBindData &bind_data,
+                              IntoWzGlobalState &global_state, DataChunk &output,
+                              const string &table_name, const string &error_message,
+                              const string &vorlauf_id = "") {
+    string rollback_err;
+    ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+    AddErrorResult(bind_data, table_name, error_message, vorlauf_id);
+    OutputResults(bind_data, global_state, output);
+}
+
+// ============================================================================
+// Read source table into bind_data.source_columns and source_rows.
 // Returns true on success, sets error_message on failure.
 // ============================================================================
 
@@ -604,15 +680,18 @@ static bool LoadSourceData(ClientContext &context,
     auto source_materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(source_result));
 
     // Get column names
+    bind_data.source_columns.reserve(source_materialized->ColumnCount());
     for (idx_t i = 0; i < source_materialized->ColumnCount(); i++) {
         bind_data.source_columns.push_back(source_materialized->ColumnName(i));
     }
 
-    // Collect all rows
+    // Collect all rows - pre-allocate for efficiency
     auto &collection = source_materialized->Collection();
+    bind_data.source_rows.reserve(collection.Count());
     for (auto &chunk : collection.Chunks()) {
         for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
             vector<Value> row;
+            row.reserve(chunk.ColumnCount());
             for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
                 row.push_back(chunk.data[col_idx].GetValue(row_idx));
             }
@@ -652,12 +731,13 @@ static bool ValidateDuplicates(ClientContext &context,
     auto duplicates = CheckDuplicates(context, bind_data.secret_name, primanota_ids);
     if (!duplicates.empty()) {
         string dup_list;
-        for (size_t i = 0; i < std::min(duplicates.size(), size_t(5)); i++) {
+        size_t display_count = std::min(duplicates.size(), MAX_DUPLICATES_TO_DISPLAY);
+        for (size_t i = 0; i < display_count; i++) {
             if (i > 0) dup_list += ", ";
             dup_list += duplicates[i];
         }
-        if (duplicates.size() > 5) {
-            dup_list += " (and " + std::to_string(duplicates.size() - 5) + " more)";
+        if (duplicates.size() > MAX_DUPLICATES_TO_DISPLAY) {
+            dup_list += " (and " + std::to_string(duplicates.size() - MAX_DUPLICATES_TO_DISPLAY) + " more)";
         }
         error_message = "Duplicate guiPrimanotaID found: " + dup_list +
             ". " + std::to_string(duplicates.size()) + " records already exist in tblPrimanota.";
@@ -740,7 +820,7 @@ static bool UpdateVorlauf(Connection &txn_conn,
     std::ostringstream sql;
     sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET ";
     sql << "strBezeichnung = '" << EscapeSqlString(bezeichnung) << "', ";
-    sql << "dtmVorlaufDatumBis = '" << date_to << " 00:00:00', ";
+    sql << "dtmVorlaufDatumBis = '" << EscapeSqlString(date_to) << " 00:00:00', ";
     sql << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', ";
     sql << "dtmGeaendert = '" << timestamp << "' ";
     sql << "WHERE guiVorlaufID = '" << EscapeSqlString(vorlauf_id) << "'";
@@ -764,20 +844,18 @@ static bool InsertPrimanota(Connection &txn_conn,
                             const string &date_to,
                             int64_t &total_rows,
                             string &error_message) {
-    const size_t BATCH_SIZE = 100;
     total_rows = 0;
 
-    for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += BATCH_SIZE) {
-        size_t batch_end = std::min(batch_start + BATCH_SIZE, bind_data.source_rows.size());
+    for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, bind_data.source_rows.size());
 
-        vector<vector<Value>> batch_rows(
-            bind_data.source_rows.begin() + batch_start,
-            bind_data.source_rows.begin() + batch_end
-        );
+        auto rows_begin = bind_data.source_rows.begin() + batch_start;
+        auto rows_end = bind_data.source_rows.begin() + batch_end;
 
         string primanota_sql = BuildPrimanotaInsertSQL(
             bind_data.secret_name,
-            batch_rows,
+            rows_begin,
+            rows_end,
             bind_data.source_columns,
             vorlauf_id,
             bind_data.gui_verfahren_id,
@@ -792,7 +870,7 @@ static bool InsertPrimanota(Connection &txn_conn,
             return false;
         }
 
-        total_rows += batch_rows.size();
+        total_rows += std::distance(rows_begin, rows_end);
     }
 
     return true;
@@ -905,6 +983,13 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         return;
     }
 
+    // Validate gui_verfahren_id looks like a UUID (defense in depth)
+    if (!IsValidUuidFormat(bind_data.gui_verfahren_id)) {
+        AddErrorResult(bind_data, "ERROR", "Invalid gui_verfahren_id format: must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)");
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
     // =========================================================================
     // Step 2: Load source data from DuckDB table
     // =========================================================================
@@ -951,32 +1036,27 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
     // =========================================================================
     // Step 4: Prepare Vorlauf data
-    // BUG FIX: Use source guiVorlaufID if provided, otherwise generate UUID
+    // Use source guiVorlaufID if provided (and generate_vorlauf_id is false),
+    // otherwise generate UUID
     // =========================================================================
-
-    auto find_vorlauf_id_col = [&bind_data]() {
-        const vector<string> candidates = {
-            "guiVorlaufID", "gui_vorlauf_id", "guivorlaufid", "guivorlauf_id"
-        };
-        for (const auto &candidate : candidates) {
-            idx_t idx = FindColumnIndex(bind_data.source_columns, candidate);
-            if (idx != DConstants::INVALID_INDEX) {
-                return idx;
-            }
-        }
-        return DConstants::INVALID_INDEX;
-    };
 
     string vorlauf_id;
     bool vorlauf_id_from_source = false;
-    idx_t vorlauf_id_col = find_vorlauf_id_col();
-    if (vorlauf_id_col != DConstants::INVALID_INDEX
-        && !bind_data.source_rows.empty()
-        && vorlauf_id_col < bind_data.source_rows[0].size()
-        && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
-        vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
-        vorlauf_id_from_source = true;
-    } else {
+
+    // If generate_vorlauf_id is true, always generate a new UUID
+    // Otherwise, use source guiVorlaufID if available
+    if (!bind_data.generate_vorlauf_id) {
+        idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
+        if (vorlauf_id_col != DConstants::INVALID_INDEX
+            && !bind_data.source_rows.empty()
+            && vorlauf_id_col < bind_data.source_rows[0].size()
+            && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
+            vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
+            vorlauf_id_from_source = true;
+        }
+    }
+
+    if (vorlauf_id.empty()) {
         // Generate deterministic UUID v5 based on all source rows and verfahren_id
         vorlauf_id = GenerateVorlaufUUID(bind_data.source_rows,
                                           bind_data.gui_verfahren_id);
@@ -1013,10 +1093,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
     string derived_bezeichnung;
     if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id, derived_bezeichnung, error_msg)) {
-        string rollback_err;
-        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-        AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
+        RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
         return;
     }
     if (!derived_bezeichnung.empty()) {
@@ -1027,10 +1104,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     if (vorlauf_id_from_source) {
         bool exists = false;
         if (!VorlaufExists(txn_conn, bind_data.secret_name, vorlauf_id, exists, error_msg)) {
-            string rollback_err;
-            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-            OutputResults(bind_data, global_state, output);
+            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
             return;
         }
         skip_vorlauf_insert = exists;
@@ -1040,10 +1114,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     if (!skip_vorlauf_insert) {
         auto vorlauf_start = std::chrono::high_resolution_clock::now();
         if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
-            string rollback_err;
-            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-            OutputResults(bind_data, global_state, output);
+            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
             return;
         }
         auto vorlauf_end = std::chrono::high_resolution_clock::now();
@@ -1053,10 +1124,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         // Vorlauf exists: update strBezeichnung and dtmVorlaufDatumBis
         auto vorlauf_start = std::chrono::high_resolution_clock::now();
         if (!UpdateVorlauf(txn_conn, bind_data.secret_name, vorlauf_id, date_to, bezeichnung, bind_data.str_angelegt, error_msg)) {
-            string rollback_err;
-            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
-            OutputResults(bind_data, global_state, output);
+            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
             return;
         }
         auto vorlauf_end = std::chrono::high_resolution_clock::now();
@@ -1068,10 +1136,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     auto primanota_start = std::chrono::high_resolution_clock::now();
     int64_t total_rows = 0;
     if (!InsertPrimanota(txn_conn, bind_data, vorlauf_id, date_to, total_rows, error_msg)) {
-        string rollback_err;
-        ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
-        AddErrorResult(bind_data, "tblPrimanota", error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
+        RollbackAndError(txn_conn, bind_data, global_state, output, "tblPrimanota", error_msg, vorlauf_id);
         return;
     }
 
