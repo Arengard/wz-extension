@@ -10,6 +10,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
 #include "yyjson.hpp"
+#include "mbedtls_wrapper.hpp"
 #include <chrono>
 #include <sstream>
 
@@ -132,11 +133,88 @@ struct IntoWzGlobalState : public GlobalTableFunctionState {
 };
 
 // ============================================================================
-// Helper: Generate UUID v4
+// Helper: Generate deterministic UUID v5 from a row key string
+// Uses SHA-1 hash with a fixed namespace UUID (DNS namespace)
 // ============================================================================
 
+// Fixed namespace UUID for UUID v5 generation (using DNS namespace as base)
+// 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+static const uint8_t NAMESPACE_UUID_BYTES[16] = {
+    0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+    0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8
+};
+
+static string GenerateUUIDv5(const string &row_key) {
+    // Create SHA-1 hash of namespace + row_key
+    duckdb_mbedtls::MbedTlsWrapper::SHA1State sha1;
+
+    // Add namespace UUID bytes
+    sha1.AddString(string(reinterpret_cast<const char*>(NAMESPACE_UUID_BYTES), 16));
+    // Add the row key
+    sha1.AddString(row_key);
+
+    // Get the SHA-1 hash (20 bytes as hex string = 40 chars)
+    string hash_hex = sha1.Finalize();
+
+    // Convert hex string to bytes (we need first 16 bytes = 32 hex chars)
+    uint8_t uuid_bytes[16];
+    for (int i = 0; i < 16; i++) {
+        char hex[3] = { hash_hex[i * 2], hash_hex[i * 2 + 1], '\0' };
+        uuid_bytes[i] = static_cast<uint8_t>(strtol(hex, nullptr, 16));
+    }
+
+    // Set version to 5 (bits 4-7 of byte 6)
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x50;
+
+    // Set variant to RFC 4122 (bits 6-7 of byte 8)
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
+
+    // Format as UUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    char uuid_str[37];
+    snprintf(uuid_str, sizeof(uuid_str),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
+             uuid_bytes[4], uuid_bytes[5], uuid_bytes[6], uuid_bytes[7],
+             uuid_bytes[8], uuid_bytes[9], uuid_bytes[10], uuid_bytes[11],
+             uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15]);
+
+    return string(uuid_str);
+}
+
+// Build a deterministic row key from row values for UUID generation
+static string BuildRowKey(const vector<Value> &row, const vector<string> &columns) {
+    std::ostringstream key;
+    for (size_t i = 0; i < row.size(); i++) {
+        if (i > 0) key << "|";
+        if (!row[i].IsNull()) {
+            key << row[i].ToString();
+        }
+    }
+    return key.str();
+}
+
+// Generate deterministic UUID for a row (backward compatible wrapper)
 static string GenerateUUID() {
+    // Fallback: generate random UUID when no row context available
     return UUID::ToString(UUID::GenerateRandomUUID());
+}
+
+// Generate deterministic UUID v5 for a specific row
+static string GenerateRowUUID(const vector<Value> &row, const vector<string> &columns) {
+    string row_key = BuildRowKey(row, columns);
+    return GenerateUUIDv5(row_key);
+}
+
+// Generate deterministic UUID v5 for Vorlauf based on all source rows
+static string GenerateVorlaufUUID(const vector<vector<Value>> &rows, const vector<string> &columns,
+                                   const string &gui_verfahren_id) {
+    std::ostringstream combined_key;
+    combined_key << "vorlauf:" << gui_verfahren_id << ":";
+    for (size_t r = 0; r < rows.size(); r++) {
+        if (r > 0) combined_key << "||";
+        combined_key << BuildRowKey(rows[r], columns);
+    }
+    return GenerateUUIDv5(combined_key.str());
 }
 
 // ============================================================================
@@ -416,7 +494,7 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
             return row[idx];
         };
 
-        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateUUID() : getValue(col_primanota_id).ToString();
+        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateRowUUID(row, columns) : getValue(col_primanota_id).ToString();
         string beleg_datum = getValue(col_beleg_datum).IsNull() ? timestamp.substr(0, 10) : getValue(col_beleg_datum).ToString();
         if (beleg_datum.length() > 10) {
             beleg_datum = beleg_datum.substr(0, 10);
@@ -1011,7 +1089,9 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
         vorlauf_id_from_source = true;
     } else {
-        vorlauf_id = GenerateUUID();
+        // Generate deterministic UUID v5 based on all source rows and verfahren_id
+        vorlauf_id = GenerateVorlaufUUID(bind_data.source_rows, bind_data.source_columns,
+                                          bind_data.gui_verfahren_id);
     }
 
     auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
@@ -1064,7 +1144,6 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     if (!derived_bezeichnung.empty()) {
         bezeichnung = std::move(derived_bezeichnung);
     }
-
     // Step 5: Insert Vorlauf (or update if already exists)
     bool skip_vorlauf_insert = false;
     if (vorlauf_id_from_source) {
