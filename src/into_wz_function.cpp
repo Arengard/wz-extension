@@ -880,7 +880,7 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
     if (min_date.size() > 10) min_date = min_date.substr(0, 10);
     if (max_date.size() > 10) max_date = max_date.substr(0, 10);
 
-    bezeichnung = az_prefix + " " + min_date + " - " + max_date;
+    bezeichnung = az_prefix + " Vorlauf " + min_date + " - " + max_date;
     return true;
 }
 
