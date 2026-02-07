@@ -776,6 +776,41 @@ static bool InsertVorlauf(Connection &txn_conn,
 }
 
 // ============================================================================
+// Update an existing tblVorlauf record (strBezeichnung and dtmVorlaufDatumBis).
+// Returns true on success, sets error_message on failure.
+// ============================================================================
+
+static bool UpdateVorlauf(Connection &txn_conn,
+                          const string &db_name,
+                          const string &vorlauf_id,
+                          const string &date_to,
+                          const string &bezeichnung,
+                          const string &str_angelegt,
+                          string &error_message) {
+    // Get current timestamp
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    char timestamp_buf[32];
+    std::strftime(timestamp_buf, sizeof(timestamp_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
+    string timestamp(timestamp_buf);
+
+    std::ostringstream sql;
+    sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET ";
+    sql << "strBezeichnung = '" << EscapeSqlString(bezeichnung) << "', ";
+    sql << "dtmVorlaufDatumBis = '" << date_to << " 00:00:00', ";
+    sql << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', ";
+    sql << "dtmGeaendert = '" << timestamp << "' ";
+    sql << "WHERE guiVorlaufID = '" << EscapeSqlString(vorlauf_id) << "'";
+
+    if (!ExecuteMssqlStatementWithConn(txn_conn, sql.str(), error_message)) {
+        error_message = "Failed to update tblVorlauf: " + error_message;
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Insert all source rows into tblPrimanota in batches of 100.
 // Returns true on success, sets total_rows and error_message on failure.
 // ============================================================================
@@ -1030,7 +1065,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         bezeichnung = std::move(derived_bezeichnung);
     }
 
-    // Step 5: Insert Vorlauf (or reuse if already exists)
+    // Step 5: Insert Vorlauf (or update if already exists)
     bool skip_vorlauf_insert = false;
     if (vorlauf_id_from_source) {
         bool exists = false;
@@ -1058,7 +1093,18 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
         AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
     } else {
-        AddSuccessResult(bind_data, "tblVorlauf", 0, vorlauf_id, 0.0);
+        // Vorlauf exists: update strBezeichnung and dtmVorlaufDatumBis
+        auto vorlauf_start = std::chrono::high_resolution_clock::now();
+        if (!UpdateVorlauf(txn_conn, bind_data.secret_name, vorlauf_id, date_to, bezeichnung, bind_data.str_angelegt, error_msg)) {
+            string rollback_err;
+            ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+            AddErrorResult(bind_data, "tblVorlauf", error_msg, vorlauf_id);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
+        auto vorlauf_end = std::chrono::high_resolution_clock::now();
+        vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+        AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, vorlauf_id, vorlauf_duration);
     }
 
     // Step 6: Insert Primanota rows
