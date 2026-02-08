@@ -892,8 +892,9 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
     bezeichnung.clear();
 
     // Query tblVerfahren directly for strAZGericht - no need to check existing Primanota
+    // Just fetch the raw value and build the prefix in C++ to avoid SQL dialect issues
     string sql =
-        "SELECT 'az - ' + LEFT(RIGHT(strAZGericht, 6), 3) AS az_prefix, strAZGericht"
+        "SELECT strAZGericht"
         " FROM " + db_name + ".dbo.tblVerfahren"
         " WHERE guiVerfahrenID = '" + EscapeSqlString(gui_verfahren_id) + "'";
 
@@ -915,19 +916,32 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
         return true;
     }
 
-    // Verify we have enough columns
-    if (chunk->ColumnCount() < 2) {
+    // Verify we have the column
+    if (chunk->ColumnCount() < 1) {
         return true;
     }
 
     // Check for null values before accessing
-    Value az_val = chunk->data[0].GetValue(0);
+    Value az_gericht_val = chunk->data[0].GetValue(0);
 
-    if (az_val.IsNull()) {
+    if (az_gericht_val.IsNull()) {
         return true;
     }
 
-    string az_prefix = az_val.ToString();
+    // Build az_prefix: equivalent to 'az - ' + LEFT(RIGHT(strAZGericht, 6), 3)
+    // This extracts 3 characters starting 6 characters from the end
+    string str_az_gericht = az_gericht_val.ToString();
+    string az_prefix = "az - ";
+    if (str_az_gericht.length() >= 6) {
+        // RIGHT(strAZGericht, 6) = last 6 chars, then LEFT(..., 3) = first 3 of those
+        az_prefix += str_az_gericht.substr(str_az_gericht.length() - 6, 3);
+    } else if (str_az_gericht.length() >= 3) {
+        // If less than 6 chars, just take first 3
+        az_prefix += str_az_gericht.substr(0, 3);
+    } else {
+        // Use whatever is available
+        az_prefix += str_az_gericht;
+    }
 
     // Use the provided date range from source data
     string min_date = date_from;
