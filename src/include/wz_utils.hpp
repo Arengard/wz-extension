@@ -182,4 +182,44 @@ inline string DeriveVorlaufBezeichnung(const string &date_from, const string &da
     return string(buffer);
 }
 
+// Extract "YYYY-MM" from a date string (first 7 chars). Returns "" if too short.
+inline string ExtractYearMonth(const string &date_str) {
+    if (date_str.length() >= 7) {
+        return date_str.substr(0, 7);
+    }
+    return "";
+}
+
+// Compute last day of a month given "YYYY-MM". Handles leap years.
+inline string GetLastDayOfMonth(const string &year_month) {
+    if (year_month.length() < 7) {
+        return year_month + "-28";
+    }
+    int year = std::stoi(year_month.substr(0, 4));
+    int month = std::stoi(year_month.substr(5, 2));
+
+    static const int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int day = days_in_month[month];
+    if (month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))) {
+        day = 29;
+    }
+
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%s-%02d", year_month.c_str(), day);
+    return string(buffer);
+}
+
+// Derive single-month Vorlauf description: "Vorlauf MM/YYYY".
+inline string DeriveMonthVorlaufBezeichnung(const string &year_month) {
+    if (year_month.length() < 7) {
+        return "Vorlauf";
+    }
+    int year = std::stoi(year_month.substr(0, 4));
+    int month = std::stoi(year_month.substr(5, 2));
+
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d", month, year);
+    return string(buffer);
+}
+
 } // namespace duckdb

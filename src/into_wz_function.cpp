@@ -12,6 +12,7 @@
 #include "mbedtls_wrapper.hpp"
 #include <chrono>
 #include <iterator>
+#include <map>
 #include <sstream>
 
 namespace duckdb {
@@ -76,6 +77,7 @@ struct IntoWzBindData : public TableFunctionData {
     int64_t lng_kanzlei_konten_rahmen_id;
     string str_angelegt;
     bool generate_vorlauf_id;
+    bool monatsvorlauf;
 
     // Source data column info
     vector<string> source_columns;
@@ -171,6 +173,20 @@ static string GenerateVorlaufUUID(const vector<vector<Value>> &rows,
     for (size_t r = 0; r < rows.size(); r++) {
         if (r > 0) combined_key << "||";
         combined_key << BuildRowKey(rows[r]);
+    }
+    return GenerateUUIDv5(combined_key.str());
+}
+
+// Generate deterministic UUID v5 for a monthly Vorlauf based on a subset of source rows
+static string GenerateMonthVorlaufUUID(const vector<vector<Value>> &rows,
+                                        const vector<idx_t> &row_indices,
+                                        const string &gui_verfahren_id,
+                                        const string &year_month) {
+    std::ostringstream combined_key;
+    combined_key << "vorlauf:" << gui_verfahren_id << ":month:" << year_month << ":";
+    for (size_t i = 0; i < row_indices.size(); i++) {
+        if (i > 0) combined_key << "||";
+        combined_key << BuildRowKey(rows[row_indices[i]]);
     }
     return GenerateUUIDv5(combined_key.str());
 }
@@ -283,6 +299,35 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
     }
 
     return {min_date, max_date};
+}
+
+// ============================================================================
+// Helper: Group source rows by YYYY-MM month key (for monatsvorlauf)
+// Returns std::map for automatic chronological ordering.
+// ============================================================================
+
+static std::map<string, vector<idx_t>> GroupRowsByMonth(const vector<vector<Value>> &rows,
+                                                         const vector<string> &columns) {
+    std::map<string, vector<idx_t>> month_groups;
+
+    idx_t date_col = FindColumnWithAliases(columns, "dtmBelegDatum");
+
+    // Compute current month fallback once
+    string current_ym = ExtractYearMonth(GetCurrentDate());
+
+    for (idx_t i = 0; i < rows.size(); i++) {
+        string ym;
+        if (date_col != DConstants::INVALID_INDEX && date_col < rows[i].size() && !rows[i][date_col].IsNull()) {
+            string date_str = rows[i][date_col].ToString();
+            ym = ExtractYearMonth(date_str);
+        }
+        if (ym.empty()) {
+            ym = current_ym;
+        }
+        month_groups[ym].push_back(i);
+    }
+
+    return month_groups;
 }
 
 // ============================================================================
@@ -532,6 +577,7 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
 
     // Set defaults (overridden by parsed parameters below)
     bind_data->generate_vorlauf_id = true;
+    bind_data->monatsvorlauf = false;
     bind_data->lng_kanzlei_konten_rahmen_id = 0;
 
     // Parse named parameters
@@ -548,6 +594,8 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
             bind_data->str_angelegt = StringValue::Get(kv.second);
         } else if (kv.first == "generate_vorlauf_id") {
             bind_data->generate_vorlauf_id = kv.second.GetValue<bool>();
+        } else if (kv.first == "monatsvorlauf") {
+            bind_data->monatsvorlauf = kv.second.GetValue<bool>();
         }
     }
 
@@ -877,6 +925,58 @@ static bool InsertPrimanota(Connection &txn_conn,
 }
 
 // ============================================================================
+// Insert a subset of source rows (by index) into tblPrimanota in batches.
+// Used by the monatsvorlauf path. Same logic as InsertPrimanota but operates
+// on a subset of rows identified by row_indices.
+// ============================================================================
+
+static bool InsertPrimanotaSubset(Connection &txn_conn,
+                                   IntoWzBindData &bind_data,
+                                   const vector<idx_t> &row_indices,
+                                   const string &vorlauf_id,
+                                   const string &date_to,
+                                   int64_t &total_rows,
+                                   string &error_message) {
+    total_rows = 0;
+
+    // Build a contiguous vector of the subset rows for BuildPrimanotaInsertSQL
+    vector<vector<Value>> subset_rows;
+    subset_rows.reserve(row_indices.size());
+    for (idx_t idx : row_indices) {
+        subset_rows.push_back(bind_data.source_rows[idx]);
+    }
+
+    for (size_t batch_start = 0; batch_start < subset_rows.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, subset_rows.size());
+
+        auto rows_begin = subset_rows.begin() + batch_start;
+        auto rows_end = subset_rows.begin() + batch_end;
+
+        string primanota_sql = BuildPrimanotaInsertSQL(
+            bind_data.secret_name,
+            rows_begin,
+            rows_end,
+            bind_data.source_columns,
+            vorlauf_id,
+            bind_data.gui_verfahren_id,
+            bind_data.str_angelegt,
+            date_to
+        );
+
+        if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
+            error_message = "Failed to insert into tblPrimanota (rows " +
+                std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
+                "): " + error_message;
+            return false;
+        }
+
+        total_rows += std::distance(rows_begin, rows_end);
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Helper: Derive strBezeichnung from MSSQL tblVerfahren data
 // Uses the provided date range (from source data) and fetches strAZGericht from tblVerfahren.
 // Returns true on success; leaves `bezeichnung` empty if no data; sets error_message on failure.
@@ -1049,7 +1149,110 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     }
 
     // =========================================================================
-    // Step 4: Prepare Vorlauf data
+    // Step 4 (monatsvorlauf): Split by month, one Vorlauf + Primanota per month
+    // =========================================================================
+
+    if (bind_data.monatsvorlauf) {
+        auto month_groups = GroupRowsByMonth(bind_data.source_rows, bind_data.source_columns);
+
+        // Open a single transaction for all months
+        auto &txn_db = DatabaseInstance::GetDatabase(context);
+        Connection txn_conn(txn_db);
+
+        if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
+            AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
+
+        for (auto &[year_month, row_indices] : month_groups) {
+            string month_date_from = year_month + "-01";
+            string month_date_to = GetLastDayOfMonth(year_month);
+
+            // Determine Vorlauf UUID for this month
+            string month_vorlauf_id;
+            bool month_vorlauf_from_source = false;
+
+            if (!bind_data.generate_vorlauf_id) {
+                idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
+                if (vorlauf_id_col != DConstants::INVALID_INDEX
+                    && vorlauf_id_col < bind_data.source_rows[row_indices[0]].size()
+                    && !bind_data.source_rows[row_indices[0]][vorlauf_id_col].IsNull()) {
+                    // Source provides a vorlauf ID — derive a month-specific UUID from it
+                    string source_id = bind_data.source_rows[row_indices[0]][vorlauf_id_col].ToString();
+                    month_vorlauf_id = GenerateUUIDv5("vorlauf:" + source_id + ":month:" + year_month);
+                    month_vorlauf_from_source = true;
+                }
+            }
+
+            if (month_vorlauf_id.empty()) {
+                month_vorlauf_id = GenerateMonthVorlaufUUID(
+                    bind_data.source_rows, row_indices,
+                    bind_data.gui_verfahren_id, year_month);
+            }
+
+            // Derive bezeichnung
+            string bezeichnung;
+            if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id,
+                                             month_date_from, month_date_to, bezeichnung, error_msg)) {
+                RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, month_vorlauf_id);
+                return;
+            }
+            if (bezeichnung.empty()) {
+                bezeichnung = DeriveMonthVorlaufBezeichnung(year_month);
+            }
+
+            // Insert or update Vorlauf
+            bool exists = false;
+            if (!VorlaufExists(txn_conn, bind_data.secret_name, month_vorlauf_id, exists, error_msg)) {
+                RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, month_vorlauf_id);
+                return;
+            }
+
+            auto vorlauf_start = std::chrono::high_resolution_clock::now();
+            if (!exists) {
+                if (!InsertVorlauf(txn_conn, bind_data, month_vorlauf_id, month_date_from, month_date_to, bezeichnung, error_msg)) {
+                    RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, month_vorlauf_id);
+                    return;
+                }
+                auto vorlauf_end = std::chrono::high_resolution_clock::now();
+                double dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+                AddSuccessResult(bind_data, "tblVorlauf", 1, month_vorlauf_id, dur);
+            } else {
+                if (!UpdateVorlauf(txn_conn, bind_data.secret_name, month_vorlauf_id, month_date_to, bezeichnung, bind_data.str_angelegt, error_msg)) {
+                    RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, month_vorlauf_id);
+                    return;
+                }
+                auto vorlauf_end = std::chrono::high_resolution_clock::now();
+                double dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+                AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, month_vorlauf_id, dur);
+            }
+
+            // Insert Primanota for this month's rows
+            auto primanota_start = std::chrono::high_resolution_clock::now();
+            int64_t month_rows = 0;
+            if (!InsertPrimanotaSubset(txn_conn, bind_data, row_indices, month_vorlauf_id, month_date_to, month_rows, error_msg)) {
+                RollbackAndError(txn_conn, bind_data, global_state, output, "tblPrimanota", error_msg, month_vorlauf_id);
+                return;
+            }
+            auto primanota_end = std::chrono::high_resolution_clock::now();
+            double primanota_dur = std::chrono::duration<double>(primanota_end - primanota_start).count();
+            AddSuccessResult(bind_data, "tblPrimanota", month_rows, month_vorlauf_id, primanota_dur);
+        }
+
+        // Commit all months atomically
+        if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
+            AddErrorResult(bind_data, "ERROR", "Failed to commit: " + error_msg);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
+
+        OutputResults(bind_data, global_state, output);
+        return;
+    }
+
+    // =========================================================================
+    // Step 4: Prepare Vorlauf data (single Vorlauf, monatsvorlauf=false)
     // Use source guiVorlaufID if provided (and generate_vorlauf_id is false),
     // otherwise generate UUID
     // =========================================================================
@@ -1182,6 +1385,7 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     into_wz_func.named_parameters["lng_kanzlei_konten_rahmen_id"] = LogicalType::BIGINT;
     into_wz_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
+    into_wz_func.named_parameters["monatsvorlauf"] = LogicalType::BOOLEAN;
 
     // Register using connection and catalog
     Connection con(db);
