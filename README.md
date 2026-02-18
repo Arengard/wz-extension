@@ -117,6 +117,7 @@ Imports data from a DuckDB table into WZ MSSQL tables (tblVorlauf and tblPrimano
 | `lng_kanzlei_konten_rahmen_id` | BIGINT | **Yes** | - | The KontenRahmenID (chart of accounts ID) |
 | `str_angelegt` | VARCHAR | No | `wz_extension` | User who created the record |
 | `generate_vorlauf_id` | BOOLEAN | No | `true` | Auto-generate guiVorlaufID |
+| `monatsvorlauf` | BOOLEAN | No | `false` | Split inserts by month — creates a separate tblVorlauf + tblPrimanota batch per calendar month |
 
 #### Return Value
 
@@ -150,6 +151,30 @@ Returns a table with insert status for each table:
 ├────────────┼───────────────┼────────────────┼──────────────────┼─────────┼─────────────────────────────────────────────────────────┤
 │ ERROR      │ 0             │                │ 0.0              │ false   │ Duplicate guiPrimanotaID found: abc-123, def-456, ...   │
 └────────────┴───────────────┴────────────────┴──────────────────┴─────────┴─────────────────────────────────────────────────────────┘
+```
+
+#### Example: Monthly Split (Monatsvorlauf)
+
+```sql
+-- Source data spans multiple months
+SELECT * FROM into_wz(
+    source_table := 'my_bookings',
+    gui_verfahren_id := '6cd5c439-110a-4e65-b7b6-0be000b58588',
+    lng_kanzlei_konten_rahmen_id := 56,
+    monatsvorlauf := true
+);
+```
+
+Example output with `monatsvorlauf := true`:
+```
+┌──────────────────────┬───────────────┬──────────────────────────────────────┬──────────────────┬─────────┬───────────────┐
+│ table_name           │ rows_inserted │ gui_vorlauf_id                       │ duration_seconds │ success │ error_message │
+├──────────────────────┼───────────────┼──────────────────────────────────────┼──────────────────┼─────────┼───────────────┤
+│ tblVorlauf           │ 1             │ a1b2c3d4-... (2025-08)               │ 0.08             │ true    │               │
+│ tblPrimanota         │ 45            │ a1b2c3d4-... (2025-08)               │ 0.52             │ true    │               │
+│ tblVorlauf           │ 1             │ e5f6a7b8-... (2025-09)               │ 0.07             │ true    │               │
+│ tblPrimanota         │ 105           │ e5f6a7b8-... (2025-09)               │ 1.12             │ true    │               │
+└──────────────────────┴───────────────┴──────────────────────────────────────┴──────────────────┴─────────┴───────────────┘
 ```
 
 ## Source Data Format
@@ -267,16 +292,33 @@ SELECT * FROM into_wz(
 - Scans all dates to find MIN/MAX `dtmBelegDatum`
 - Derives `strBezeichnung` like "Vorlauf 09/2025-09/2025"
 - Sets `lngStatus = 1` (active)
+- If the Vorlauf already exists (same UUID), it is **updated** (`strBezeichnung`, `dtmVorlaufDatumBis`, `strGeaendert`, `dtmGeaendert`) instead of inserted
 
 ### 4. Transaction Handling
 ```
 BEGIN TRANSACTION
-  → INSERT tblVorlauf (1 row)
+  → INSERT or UPDATE tblVorlauf (1 row)
   → INSERT tblPrimanota (N rows in batches of 100)
 COMMIT
 ```
 
 If any insert fails, the entire transaction is rolled back.
+
+### 4a. Monthly Split (`monatsvorlauf`)
+
+When `monatsvorlauf := true`, the function groups source rows by `dtmBelegDatum` month and creates a **separate tblVorlauf + tblPrimanota batch per calendar month**:
+
+```
+BEGIN TRANSACTION
+  → For each YYYY-MM in source data (chronological order):
+      → INSERT or UPDATE tblVorlauf (date range = first to last day of that month)
+      → INSERT tblPrimanota (only rows belonging to that month, in batches of 100)
+COMMIT
+```
+
+- Each monthly Vorlauf receives a deterministic UUID v5 derived from the verfahren ID, year-month, and row keys
+- The `strBezeichnung` is derived per month (e.g. "Vorlauf 09/2025")
+- All months are wrapped in a **single transaction** — either all succeed or all are rolled back
 
 ### 5. Column Mapping
 Source columns are mapped to tblPrimanota columns case-insensitively:
