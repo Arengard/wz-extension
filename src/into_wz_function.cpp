@@ -27,6 +27,7 @@ namespace duckdb {
 
 static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 1000;
 static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
+static constexpr size_t MSSQL_INSERT_BATCH_SIZE = 500;  // rows per multi-row INSERT VALUES
 
 // Staging table name for bulk Primanota transfer
 static const char *STAGING_TABLE_NAME = "__wz_primanota_staging";
@@ -1033,18 +1034,86 @@ static bool PopulateStagingTable(Connection &staging_conn,
 // Single operation lets DuckDB's MSSQL extension handle native bulk transfer.
 // ============================================================================
 
+// Read rows from the staging table and insert into MSSQL via batched
+// multi-row INSERT VALUES statements.  The INSERT INTO ... SELECT approach
+// goes through DuckDB's MSSQL extension which does row-by-row TDS inserts.
+// Building VALUES tuples ourselves packs ~500 rows per round-trip instead.
 static bool BulkTransferPrimanota(Connection &txn_conn,
+                                   Connection &staging_conn,
                                    const string &db_name,
-                                   string &error_message) {
-    string sql = string("INSERT INTO ") + db_name + ".dbo.tblPrimanota (" +
-                 PRIMANOTA_COLUMN_LIST + ") SELECT " + PRIMANOTA_COLUMN_LIST +
-                 " FROM " + STAGING_TABLE_NAME;
-
-    if (!ExecuteMssqlStatementWithConn(txn_conn, sql, error_message)) {
-        error_message = "Failed to bulk transfer to tblPrimanota: " + error_message;
+                                   string &error_message,
+                                   const string &year_month_filter = "") {
+    // Read rows from staging
+    string select_sql = string("SELECT ") + PRIMANOTA_COLUMN_LIST +
+                        " FROM " + STAGING_TABLE_NAME;
+    if (!year_month_filter.empty()) {
+        select_sql += " WHERE year_month = '" + EscapeSqlString(year_month_filter) + "'";
+    }
+    auto staging_result = staging_conn.Query(select_sql);
+    if (staging_result->HasError()) {
+        error_message = "Failed to read staging table: " + staging_result->GetError();
         return false;
     }
-    return true;
+
+    idx_t col_count = staging_result->types.size();
+    string insert_prefix = string("INSERT INTO ") + db_name + ".dbo.tblPrimanota (" +
+                           PRIMANOTA_COLUMN_LIST + ") VALUES ";
+
+    // Iterate result chunks and build batched INSERT VALUES
+    idx_t rows_in_batch = 0;
+    string values_sql;
+
+    auto flush_batch = [&]() -> bool {
+        if (rows_in_batch == 0) return true;
+        string sql = insert_prefix + values_sql;
+        if (!ExecuteMssqlStatementWithConn(txn_conn, sql, error_message)) {
+            error_message = "Failed to insert batch into tblPrimanota: " + error_message;
+            return false;
+        }
+        rows_in_batch = 0;
+        values_sql.clear();
+        return true;
+    };
+
+    for (auto &chunk : staging_result->Collection().Chunks()) {
+        idx_t row_count = chunk.size();
+        for (idx_t row = 0; row < row_count; row++) {
+            if (rows_in_batch > 0) {
+                values_sql += ",";
+            }
+            values_sql += "(";
+            for (idx_t col = 0; col < col_count; col++) {
+                if (col > 0) values_sql += ",";
+                Value val = chunk.data[col].GetValue(row);
+                if (val.IsNull()) {
+                    values_sql += "NULL";
+                } else {
+                    string str_val = val.ToString();
+                    // INTEGER columns: lngTimestamp, lngStatus, lngZeilenNr,
+                    // lngEingabeWaehrungID, lngBu, ysnSoll, ysnEaTransaktionenManuell,
+                    // lngSachverhalt13b, ysnIstversteuerungInSollversteuerung,
+                    // lngSkontoSachverhaltWarenRHB, ysnVStBeiZahlung, ysnGeneralUmkehr,
+                    // ysnMitUrsprungsland
+                    auto &type = staging_result->types[col];
+                    if (type == LogicalType::INTEGER || type == LogicalType::BIGINT ||
+                        type == LogicalType::SMALLINT || type == LogicalType::TINYINT) {
+                        values_sql += str_val;
+                    } else {
+                        values_sql += "'" + EscapeSqlString(str_val) + "'";
+                    }
+                }
+            }
+            values_sql += ")";
+            rows_in_batch++;
+
+            if (rows_in_batch >= MSSQL_INSERT_BATCH_SIZE) {
+                if (!flush_batch()) return false;
+            }
+        }
+    }
+
+    // Flush remaining rows
+    return flush_batch();
 }
 
 // ============================================================================
@@ -1846,8 +1915,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         auto &db = DatabaseInstance::GetDatabase(context);
 
         if (bind_data.monatsvorlauf) {
-            // All months in one Execute call to keep the MSSQL connection alive.
-            // Returning between months lets the TDS connection go idle and time out.
+            // Sequential per-month transfer with batched multi-row INSERT VALUES.
             auto transfer_start = std::chrono::high_resolution_clock::now();
             int64_t total_transferred = 0;
 
@@ -1862,12 +1930,8 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     return;
                 }
 
-                string sql = string("INSERT INTO ") + bind_data.secret_name + ".dbo.tblPrimanota (" +
-                             PRIMANOTA_COLUMN_LIST + ") SELECT " + PRIMANOTA_COLUMN_LIST +
-                             " FROM " + STAGING_TABLE_NAME +
-                             " WHERE year_month = '" + EscapeSqlString(mi.year_month) + "'";
-
-                if (!ExecuteMssqlStatementWithConn(conn, sql, error_msg)) {
+                if (!BulkTransferPrimanota(conn, *state.staging_conn, bind_data.secret_name,
+                                            error_msg, mi.year_month)) {
                     string rb_err;
                     ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
                     CleanupAndError(state, bind_data, output, "tblPrimanota",
@@ -1903,7 +1967,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             // Single-vorlauf: bulk transfer within open transaction
             auto transfer_start = std::chrono::high_resolution_clock::now();
 
-            if (!BulkTransferPrimanota(*state.txn_conn, bind_data.secret_name, error_msg)) {
+            if (!BulkTransferPrimanota(*state.txn_conn, *state.staging_conn, bind_data.secret_name, error_msg)) {
                 CleanupAndError(state, bind_data, output, "tblPrimanota", error_msg, state.vorlauf_id);
                 return;
             }
