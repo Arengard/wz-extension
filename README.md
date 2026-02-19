@@ -118,6 +118,8 @@ Imports data from a DuckDB table into WZ MSSQL tables (tblVorlauf and tblPrimano
 | `str_angelegt` | VARCHAR | No | `wz_extension` | User who created the record |
 | `generate_vorlauf_id` | BOOLEAN | No | `true` | Auto-generate guiVorlaufID |
 | `monatsvorlauf` | BOOLEAN | No | `false` | Split inserts by month — creates a separate tblVorlauf + tblPrimanota batch per calendar month |
+| `skip_duplicate_check` | BOOLEAN | No | `false` | Skip duplicate guiPrimanotaID check before insert |
+| `skip_fk_check` | BOOLEAN | No | `false` | Skip foreign key constraint validation before insert |
 
 #### Return Value
 
@@ -298,7 +300,7 @@ SELECT * FROM into_wz(
 ```
 BEGIN TRANSACTION
   → INSERT or UPDATE tblVorlauf (1 row)
-  → INSERT tblPrimanota (N rows in batches of 100)
+  → INSERT tblPrimanota (N rows in batches of 1,000, 10 batches per round-trip)
 COMMIT
 ```
 
@@ -312,7 +314,7 @@ When `monatsvorlauf := true`, the function groups source rows by `dtmBelegDatum`
 BEGIN TRANSACTION
   → For each YYYY-MM in source data (chronological order):
       → INSERT or UPDATE tblVorlauf (date range = first to last day of that month)
-      → INSERT tblPrimanota (only rows belonging to that month, in batches of 100)
+      → INSERT tblPrimanota (only rows belonging to that month, in batches of 1,000)
 COMMIT
 ```
 
@@ -347,6 +349,37 @@ dtmVorlaufDatumBis       →  (from Vorlauf)
 strAngelegt              →  (from parameter)
 dtmAngelegt              →  (current timestamp)
 ```
+
+## Performance
+
+The extension is optimized for large datasets (100k+ rows):
+
+- **Batch size**: 1,000 rows per INSERT statement (MSSQL VALUES limit)
+- **Multi-statement batching**: 10 INSERT statements per network round-trip
+- **Pre-computed UUIDs**: All primanota IDs are generated before the insert loop
+- **Minimal overhead**: Column indices cached, constants pre-escaped, zero-copy row access
+
+For 500,000 rows this means ~50 network round-trips instead of ~5,000.
+
+### Maximum Speed for Trusted Data
+
+When your source data is pre-validated (correct UUIDs, valid FK references), skip the validation steps:
+
+```sql
+SELECT * FROM into_wz(
+    source_table := 'my_large_table',
+    gui_verfahren_id := '6cd5c439-110a-4e65-b7b6-0be000b58588',
+    lng_kanzlei_konten_rahmen_id := 56,
+    skip_duplicate_check := true,
+    skip_fk_check := true
+);
+```
+
+| Validation | Default | With skip flags |
+|------------|---------|-----------------|
+| Duplicate ID check | 500 queries (500k rows) | Skipped |
+| FK constraint check | ~5-10 queries | Skipped |
+| INSERT round-trips | ~50 | ~50 |
 
 ## Error Handling
 
