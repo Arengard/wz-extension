@@ -3,8 +3,24 @@
 #include "duckdb.hpp"
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
 
 namespace duckdb {
+
+// ============================================================================
+// Duration formatting
+// ============================================================================
+
+// Format a duration in seconds to hh:mm:ss string.
+inline string FormatDuration(double seconds) {
+    int total = static_cast<int>(seconds + 0.5);  // round to nearest second
+    int h = total / 3600;
+    int m = (total % 3600) / 60;
+    int s = total % 60;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+    return string(buf);
+}
 
 // ============================================================================
 // SQL helpers

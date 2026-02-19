@@ -36,7 +36,7 @@ struct InsertResult {
     string table_name;
     int64_t rows_inserted;
     string gui_vorlauf_id;
-    double duration_seconds;
+    string duration;  // formatted as hh:mm:ss
     bool success;
     string error_message;
 };

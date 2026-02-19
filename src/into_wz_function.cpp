@@ -637,12 +637,12 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
     bind_data->executed = false;
 
     // Define return columns
-    names = {"table_name", "rows_inserted", "gui_vorlauf_id", "duration_seconds", "success", "error_message"};
+    names = {"table_name", "rows_inserted", "gui_vorlauf_id", "duration", "success", "error_message"};
     return_types = {
         LogicalType::VARCHAR,   // table_name
         LogicalType::BIGINT,    // rows_inserted
         LogicalType::VARCHAR,   // gui_vorlauf_id
-        LogicalType::DOUBLE,    // duration_seconds
+        LogicalType::VARCHAR,   // duration (hh:mm:ss)
         LogicalType::BOOLEAN,   // success
         LogicalType::VARCHAR    // error_message
     };
@@ -669,7 +669,7 @@ static void AddErrorResult(IntoWzBindData &bind_data, const string &table_name,
     result.table_name = table_name;
     result.rows_inserted = 0;
     result.gui_vorlauf_id = vorlauf_id;
-    result.duration_seconds = 0;
+    result.duration = "00:00:00";
     result.success = false;
     result.error_message = error_message;
     bind_data.results.push_back(result);
@@ -685,7 +685,7 @@ static void AddSuccessResult(IntoWzBindData &bind_data, const string &table_name
     result.table_name = table_name;
     result.rows_inserted = rows;
     result.gui_vorlauf_id = vorlauf_id;
-    result.duration_seconds = duration;
+    result.duration = FormatDuration(duration);
     result.success = true;
     result.error_message = "";
     bind_data.results.push_back(result);
@@ -711,7 +711,7 @@ static void OutputResults(IntoWzBindData &bind_data,
         output.SetValue(0, count, Value(result.table_name));
         output.SetValue(1, count, Value(result.rows_inserted));
         output.SetValue(2, count, Value(result.gui_vorlauf_id));
-        output.SetValue(3, count, Value(result.duration_seconds));
+        output.SetValue(3, count, Value(result.duration));
         output.SetValue(4, count, Value(result.success));
         output.SetValue(5, count, Value(result.error_message));
         global_state.current_idx++;
@@ -1561,7 +1561,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             warning.table_name = "FK_VALIDATION";
             warning.rows_inserted = 0;
             warning.gui_vorlauf_id = "";
-            warning.duration_seconds = 0;
+            warning.duration = "00:00:00";
             warning.success = true;
             warning.error_message = error_msg;
             bind_data.results.push_back(warning);
