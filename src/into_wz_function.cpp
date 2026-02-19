@@ -74,6 +74,22 @@ static const char *STAGING_TABLE_DDL =
 // Column alias mappings are defined in wz_utils.hpp (FindColumnWithAliases)
 // as a single source of truth shared with constraint_checker.cpp.
 
+// Execution phases for the state-machine Execute loop.
+// Each phase does one unit of work, emits result rows, and yields to DuckDB
+// so that the progress bar can update between phases.
+enum class ExecutionPhase {
+    VALIDATE_PARAMS,      // 0→5%
+    LOAD_DATA,            // 5→20%   (includes row key computation)
+    VALIDATE_DATA,        // 20→35%  (duplicate check + FK validation)
+    PRE_COMPUTE,          // 35→50%  (UUIDs, month grouping, AZ prefix)
+    POPULATE_STAGING,     // 50→65%
+    VORLAUF_RECORDS,      // 65→80%
+    TRANSFER_PRIMANOTA,   // 80→95%
+    FINALIZE,             // 95→100% (TIMING:total)
+    OUTPUT_RESULTS,       // drain remaining result rows
+    DONE                  // return empty → pipeline ends
+};
+
 // Pre-computed column indices to avoid redundant lookups per batch
 struct PrimanotaColumnIndices {
     idx_t col_primanota_id;
@@ -176,10 +192,52 @@ struct IntoWzBindData : public TableFunctionData {
 // Global state for into_wz function
 // ============================================================================
 
+// Per-month data used by monatsvorlauf (batch Vorlauf + parallel Primanota)
+struct MonthInfo {
+    string year_month;
+    vector<idx_t> row_indices;
+    string vorlauf_id;
+    string bezeichnung;
+    string date_from;
+    string date_to;
+    vector<string> primanota_ids;
+};
+
 struct IntoWzGlobalState : public GlobalTableFunctionState {
     idx_t current_idx;
-    IntoWzGlobalState() : current_idx(0) {}
+    ExecutionPhase phase;
+    double progress;  // 0.0–100.0, read by IntoWzProgress callback
+
+    // Timers
+    std::chrono::high_resolution_clock::time_point total_start;
+
+    // Persistent state across phases
+    PrimanotaColumnIndices col_idx;
+    unique_ptr<Connection> staging_conn;
+    unique_ptr<Connection> txn_conn;
+
+    // Single-vorlauf state
+    string vorlauf_id;
+    string date_from, date_to, bezeichnung;
+    vector<string> primanota_ids;
+    bool vorlauf_id_from_source;
+    bool skip_vorlauf_insert;
+
+    // Monatsvorlauf state
+    vector<MonthInfo> months;
+    string cached_az_prefix;
+
+    IntoWzGlobalState() : current_idx(0), phase(ExecutionPhase::VALIDATE_PARAMS),
+                           progress(0.0), vorlauf_id_from_source(false),
+                           skip_vorlauf_insert(false) {}
 };
+
+// Progress callback: DuckDB polls this between Execute calls.
+static double IntoWzProgress(ClientContext &context, const FunctionData *bind_data_p,
+                              const GlobalTableFunctionState *global_state_p) {
+    auto &state = global_state_p->Cast<IntoWzGlobalState>();
+    return state.progress;
+}
 
 // ============================================================================
 // Helper: Generate deterministic UUID v5 from a row key string
@@ -658,18 +716,29 @@ static void OutputResults(IntoWzBindData &bind_data,
     output.SetCardinality(count);
 }
 
+// Forward declaration (defined after staging table helpers)
+static void DropStagingTable(Connection &staging_conn);
+
 // ============================================================================
-// Helper: Rollback transaction and add error result (reduces repetitive pattern)
+// Helper: Clean up open connections, add error, and jump to OUTPUT_RESULTS.
+// Handles both staging table drop and transaction rollback.
 // ============================================================================
 
-static void RollbackAndError(Connection &txn_conn, IntoWzBindData &bind_data,
-                              IntoWzGlobalState &global_state, DataChunk &output,
-                              const string &table_name, const string &error_message,
-                              const string &vorlauf_id = "") {
-    string rollback_err;
-    ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rollback_err);
+static void CleanupAndError(IntoWzGlobalState &state, IntoWzBindData &bind_data,
+                             DataChunk &output, const string &table_name,
+                             const string &error_message, const string &vorlauf_id = "") {
+    if (state.txn_conn) {
+        string rb_err;
+        ExecuteMssqlStatementWithConn(*state.txn_conn, "ROLLBACK", rb_err);
+        state.txn_conn.reset();
+    }
+    if (state.staging_conn) {
+        DropStagingTable(*state.staging_conn);
+        state.staging_conn.reset();
+    }
     AddErrorResult(bind_data, table_name, error_message, vorlauf_id);
-    OutputResults(bind_data, global_state, output);
+    state.phase = ExecutionPhase::OUTPUT_RESULTS;
+    OutputResults(bind_data, state, output);
 }
 
 // ============================================================================
@@ -977,20 +1046,6 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
     }
     return true;
 }
-
-// ============================================================================
-// Per-month data used by monatsvorlauf (batch Vorlauf + parallel Primanota)
-// ============================================================================
-
-struct MonthInfo {
-    string year_month;
-    vector<idx_t> row_indices;
-    string vorlauf_id;
-    string bezeichnung;
-    string date_from;
-    string date_to;
-    vector<string> primanota_ids;
-};
 
 // ============================================================================
 // Parallel per-month Primanota transfer: one thread per month-batch, up to
@@ -1376,227 +1431,319 @@ static bool DeriveBezeichnungFromMssql(Connection &conn,
 
 static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
     auto &bind_data = data_p.bind_data->CastNoConst<IntoWzBindData>();
-    auto &global_state = data_p.global_state->Cast<IntoWzGlobalState>();
+    auto &state = data_p.global_state->Cast<IntoWzGlobalState>();
 
-    // Re-entry: return remaining results
-    if (bind_data.executed) {
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-    bind_data.executed = true;
-
-    // =========================================================================
-    // Step 1: Validate required parameters
-    // =========================================================================
-
-    if (bind_data.gui_verfahren_id.empty()) {
-        AddErrorResult(bind_data, "ERROR", "gui_verfahren_id is required");
-        OutputResults(bind_data, global_state, output);
+    // Pipeline end: return empty chunk
+    if (state.phase == ExecutionPhase::DONE) {
+        output.SetCardinality(0);
         return;
     }
 
-    if (bind_data.source_table.empty()) {
-        AddErrorResult(bind_data, "ERROR", "source_table is required");
-        OutputResults(bind_data, global_state, output);
+    // Drain accumulated result rows
+    if (state.phase == ExecutionPhase::OUTPUT_RESULTS) {
+        OutputResults(bind_data, state, output);
+        if (output.size() == 0) {
+            state.phase = ExecutionPhase::DONE;
+        }
+        state.progress = 100.0;
         return;
     }
-
-    if (bind_data.lng_kanzlei_konten_rahmen_id <= 0) {
-        AddErrorResult(bind_data, "ERROR", "lng_kanzlei_konten_rahmen_id is required and must be positive");
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    if (!IsValidSqlIdentifier(bind_data.secret_name)) {
-        AddErrorResult(bind_data, "ERROR", "Invalid secret name: must contain only alphanumeric characters, underscores, and dots");
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    // Validate gui_verfahren_id looks like a UUID (defense in depth)
-    if (!IsValidUuidFormat(bind_data.gui_verfahren_id)) {
-        AddErrorResult(bind_data, "ERROR", "Invalid gui_verfahren_id format: must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)");
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    // =========================================================================
-    // Step 2: Load source data from DuckDB table
-    // =========================================================================
-
-    auto total_start = std::chrono::high_resolution_clock::now();
 
     string error_msg;
-    auto load_start = std::chrono::high_resolution_clock::now();
-    if (!LoadSourceData(context, bind_data, error_msg)) {
-        AddErrorResult(bind_data, "ERROR", error_msg);
-        OutputResults(bind_data, global_state, output);
+
+    switch (state.phase) {
+
+    // -----------------------------------------------------------------
+    // VALIDATE_PARAMS  (0 → 5%)
+    // -----------------------------------------------------------------
+    case ExecutionPhase::VALIDATE_PARAMS: {
+        state.total_start = std::chrono::high_resolution_clock::now();
+
+        if (bind_data.gui_verfahren_id.empty()) {
+            AddErrorResult(bind_data, "ERROR", "gui_verfahren_id is required");
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
+            return;
+        }
+        if (bind_data.source_table.empty()) {
+            AddErrorResult(bind_data, "ERROR", "source_table is required");
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
+            return;
+        }
+        if (bind_data.lng_kanzlei_konten_rahmen_id <= 0) {
+            AddErrorResult(bind_data, "ERROR", "lng_kanzlei_konten_rahmen_id is required and must be positive");
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
+            return;
+        }
+        if (!IsValidSqlIdentifier(bind_data.secret_name)) {
+            AddErrorResult(bind_data, "ERROR", "Invalid secret name: must contain only alphanumeric characters, underscores, and dots");
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
+            return;
+        }
+        if (!IsValidUuidFormat(bind_data.gui_verfahren_id)) {
+            AddErrorResult(bind_data, "ERROR", "Invalid gui_verfahren_id format: must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)");
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
+            return;
+        }
+
+        state.phase = ExecutionPhase::LOAD_DATA;
+        state.progress = 5.0;
+        // Emit a progress row to keep the pipeline alive
+        AddSuccessResult(bind_data, "PROGRESS:validating", 0, "", 0.0);
+        OutputResults(bind_data, state, output);
         return;
     }
-    auto load_end = std::chrono::high_resolution_clock::now();
-    double load_dur = std::chrono::duration<double>(load_end - load_start).count();
-    AddSuccessResult(bind_data, "TIMING:load", static_cast<int64_t>(bind_data.source_rows.size()), "", load_dur);
 
-    // Pre-compute row keys once (avoids repeated ToString per cell in UUID generation)
-    auto key_start = std::chrono::high_resolution_clock::now();
-    bind_data.row_keys.reserve(bind_data.source_rows.size());
-    for (const auto &row : bind_data.source_rows) {
-        bind_data.row_keys.push_back(BuildRowKey(row));
-    }
-    auto key_end = std::chrono::high_resolution_clock::now();
-    double key_dur = std::chrono::duration<double>(key_end - key_start).count();
-    AddSuccessResult(bind_data, "TIMING:row_keys", static_cast<int64_t>(bind_data.row_keys.size()), "", key_dur);
-
-    // =========================================================================
-    // Step 3: Check for duplicate Primanota IDs (skippable for trusted data)
-    // =========================================================================
-
-    if (!bind_data.skip_duplicate_check) {
-        if (!ValidateDuplicates(context, bind_data, error_msg)) {
+    // -----------------------------------------------------------------
+    // LOAD_DATA  (5 → 20%)  —  load source + compute row keys
+    // -----------------------------------------------------------------
+    case ExecutionPhase::LOAD_DATA: {
+        auto load_start = std::chrono::high_resolution_clock::now();
+        if (!LoadSourceData(context, bind_data, error_msg)) {
             AddErrorResult(bind_data, "ERROR", error_msg);
-            OutputResults(bind_data, global_state, output);
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
             return;
         }
-    }
+        auto load_end = std::chrono::high_resolution_clock::now();
+        double load_dur = std::chrono::duration<double>(load_end - load_start).count();
+        AddSuccessResult(bind_data, "TIMING:load", static_cast<int64_t>(bind_data.source_rows.size()), "", load_dur);
 
-    // =========================================================================
-    // Step 3.5: Validate foreign key constraints (skippable for trusted data)
-    // =========================================================================
-
-    if (!bind_data.skip_fk_check) {
-        if (!ValidateForeignKeys(context, bind_data.secret_name,
-                                 bind_data.source_rows, bind_data.source_columns, error_msg)) {
-            AddErrorResult(bind_data, "ERROR", error_msg);
-            OutputResults(bind_data, global_state, output);
-            return;
+        // Pre-compute row keys
+        auto key_start = std::chrono::high_resolution_clock::now();
+        bind_data.row_keys.reserve(bind_data.source_rows.size());
+        for (const auto &row : bind_data.source_rows) {
+            bind_data.row_keys.push_back(BuildRowKey(row));
         }
-    }
-    // Propagate FK validation warning as informational row
-    if (!error_msg.empty()) {
-        InsertResult warning;
-        warning.table_name = "FK_VALIDATION";
-        warning.rows_inserted = 0;
-        warning.gui_vorlauf_id = "";
-        warning.duration_seconds = 0;
-        warning.success = true;
-        warning.error_message = error_msg;
-        bind_data.results.push_back(warning);
-        error_msg.clear();
+        auto key_end = std::chrono::high_resolution_clock::now();
+        double key_dur = std::chrono::duration<double>(key_end - key_start).count();
+        AddSuccessResult(bind_data, "TIMING:row_keys", static_cast<int64_t>(bind_data.row_keys.size()), "", key_dur);
+
+        state.phase = ExecutionPhase::VALIDATE_DATA;
+        state.progress = 20.0;
+        OutputResults(bind_data, state, output);
+        return;
     }
 
-    // Get database instance for connections
-    auto &db = DatabaseInstance::GetDatabase(context);
-    auto col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
-
-    // =========================================================================
-    // Step 4 (monatsvorlauf): Staging table bulk transfer approach
-    //   Phase 1: Pre-compute (UUIDs, month groups, cached AZ prefix)
-    //   Phase 2: Populate local staging table via Appender
-    //   Phase 3: MSSQL transaction (Vorlauf records + one bulk INSERT INTO SELECT)
-    // =========================================================================
-
-    if (bind_data.monatsvorlauf) {
-        auto month_groups = GroupRowsByMonth(bind_data.source_rows, bind_data.source_columns);
-
-        // --- Phase 1: Pre-computation ---
-
-        // Cache AZ prefix once (avoids N identical MSSQL queries)
-        string cached_az_prefix;
-        {
-            Connection fetch_conn(db);
-            if (!FetchAZPrefix(fetch_conn, bind_data.secret_name, bind_data.gui_verfahren_id, cached_az_prefix, error_msg)) {
+    // -----------------------------------------------------------------
+    // VALIDATE_DATA  (20 → 35%)  —  duplicate check + FK validation
+    // -----------------------------------------------------------------
+    case ExecutionPhase::VALIDATE_DATA: {
+        if (!bind_data.skip_duplicate_check) {
+            if (!ValidateDuplicates(context, bind_data, error_msg)) {
                 AddErrorResult(bind_data, "ERROR", error_msg);
-                OutputResults(bind_data, global_state, output);
+                state.phase = ExecutionPhase::OUTPUT_RESULTS;
+                OutputResults(bind_data, state, output);
                 return;
             }
         }
 
-        // Pre-compute per-month data: vorlauf UUIDs, primanota IDs, bezeichnung
-        vector<MonthInfo> months;
-        months.reserve(month_groups.size());
+        if (!bind_data.skip_fk_check) {
+            if (!ValidateForeignKeys(context, bind_data.secret_name,
+                                     bind_data.source_rows, bind_data.source_columns, error_msg)) {
+                AddErrorResult(bind_data, "ERROR", error_msg);
+                state.phase = ExecutionPhase::OUTPUT_RESULTS;
+                OutputResults(bind_data, state, output);
+                return;
+            }
+        }
+        // Propagate FK validation warning
+        if (!error_msg.empty()) {
+            InsertResult warning;
+            warning.table_name = "FK_VALIDATION";
+            warning.rows_inserted = 0;
+            warning.gui_vorlauf_id = "";
+            warning.duration_seconds = 0;
+            warning.success = true;
+            warning.error_message = error_msg;
+            bind_data.results.push_back(warning);
+            error_msg.clear();
+        }
 
+        state.col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
+
+        state.phase = ExecutionPhase::PRE_COMPUTE;
+        state.progress = 35.0;
+        // Emit progress row if no FK warning was produced
+        if (bind_data.results.size() <= state.current_idx) {
+            AddSuccessResult(bind_data, "PROGRESS:validation", 0, "", 0.0);
+        }
+        OutputResults(bind_data, state, output);
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // PRE_COMPUTE  (35 → 50%)  —  UUIDs, month groups, AZ prefix
+    // -----------------------------------------------------------------
+    case ExecutionPhase::PRE_COMPUTE: {
+        auto &db = DatabaseInstance::GetDatabase(context);
         auto uuid_start = std::chrono::high_resolution_clock::now();
-        for (auto &[year_month, row_indices] : month_groups) {
-            MonthInfo mi;
-            mi.year_month = year_month;
-            mi.row_indices = std::move(row_indices);
-            mi.date_from = year_month + "-01";
-            mi.date_to = GetLastDayOfMonth(year_month);
 
-            // Compute vorlauf UUID for this month
+        if (bind_data.monatsvorlauf) {
+            // --- Monatsvorlauf pre-computation ---
+            auto month_groups = GroupRowsByMonth(bind_data.source_rows, bind_data.source_columns);
+
+            // Cache AZ prefix once
+            {
+                Connection fetch_conn(db);
+                if (!FetchAZPrefix(fetch_conn, bind_data.secret_name, bind_data.gui_verfahren_id, state.cached_az_prefix, error_msg)) {
+                    AddErrorResult(bind_data, "ERROR", error_msg);
+                    state.phase = ExecutionPhase::OUTPUT_RESULTS;
+                    OutputResults(bind_data, state, output);
+                    return;
+                }
+            }
+
+            state.months.reserve(month_groups.size());
+            for (auto &[year_month, row_indices] : month_groups) {
+                MonthInfo mi;
+                mi.year_month = year_month;
+                mi.row_indices = std::move(row_indices);
+                mi.date_from = year_month + "-01";
+                mi.date_to = GetLastDayOfMonth(year_month);
+
+                // Vorlauf UUID
+                if (!bind_data.generate_vorlauf_id) {
+                    idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
+                    if (vorlauf_id_col != DConstants::INVALID_INDEX
+                        && vorlauf_id_col < bind_data.source_rows[mi.row_indices[0]].size()
+                        && !bind_data.source_rows[mi.row_indices[0]][vorlauf_id_col].IsNull()) {
+                        string source_id = bind_data.source_rows[mi.row_indices[0]][vorlauf_id_col].ToString();
+                        mi.vorlauf_id = GenerateUUIDv5("vorlauf:" + source_id + ":month:" + year_month);
+                    }
+                }
+                if (mi.vorlauf_id.empty()) {
+                    mi.vorlauf_id = GenerateMonthVorlaufUUID(
+                        bind_data.row_keys, mi.row_indices,
+                        bind_data.gui_verfahren_id, year_month);
+                }
+
+                // Bezeichnung
+                if (!state.cached_az_prefix.empty()) {
+                    mi.bezeichnung = BuildBezeichnungFromPrefix(state.cached_az_prefix, mi.date_from, mi.date_to);
+                } else {
+                    mi.bezeichnung = DeriveMonthVorlaufBezeichnung(year_month);
+                }
+
+                // Primanota IDs
+                mi.primanota_ids = PreComputePrimanotaIds(
+                    bind_data.source_rows, bind_data.row_keys,
+                    mi.row_indices.size(), mi.row_indices.data(),
+                    state.col_idx.col_primanota_id);
+
+                state.months.push_back(std::move(mi));
+            }
+        } else {
+            // --- Single-vorlauf pre-computation ---
             if (!bind_data.generate_vorlauf_id) {
                 idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
                 if (vorlauf_id_col != DConstants::INVALID_INDEX
-                    && vorlauf_id_col < bind_data.source_rows[mi.row_indices[0]].size()
-                    && !bind_data.source_rows[mi.row_indices[0]][vorlauf_id_col].IsNull()) {
-                    string source_id = bind_data.source_rows[mi.row_indices[0]][vorlauf_id_col].ToString();
-                    mi.vorlauf_id = GenerateUUIDv5("vorlauf:" + source_id + ":month:" + year_month);
+                    && !bind_data.source_rows.empty()
+                    && vorlauf_id_col < bind_data.source_rows[0].size()
+                    && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
+                    state.vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
+                    state.vorlauf_id_from_source = true;
                 }
             }
-            if (mi.vorlauf_id.empty()) {
-                mi.vorlauf_id = GenerateMonthVorlaufUUID(
-                    bind_data.row_keys, mi.row_indices,
-                    bind_data.gui_verfahren_id, year_month);
+            if (state.vorlauf_id.empty()) {
+                state.vorlauf_id = GenerateVorlaufUUID(bind_data.row_keys, bind_data.gui_verfahren_id);
             }
 
-            // Build bezeichnung from cached AZ prefix
-            if (!cached_az_prefix.empty()) {
-                mi.bezeichnung = BuildBezeichnungFromPrefix(cached_az_prefix, mi.date_from, mi.date_to);
-            } else {
-                mi.bezeichnung = DeriveMonthVorlaufBezeichnung(year_month);
-            }
+            auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+            state.date_from = date_range.first;
+            state.date_to = date_range.second;
+            if (state.date_from.empty()) state.date_from = GetCurrentMonthStart();
+            if (state.date_to.empty()) state.date_to = GetCurrentDate();
 
-            // Pre-compute primanota IDs for this month
-            mi.primanota_ids = PreComputePrimanotaIds(
+            state.bezeichnung = DeriveVorlaufBezeichnung(state.date_from, state.date_to);
+
+            // Pre-compute primanota IDs
+            state.primanota_ids = PreComputePrimanotaIds(
                 bind_data.source_rows, bind_data.row_keys,
-                mi.row_indices.size(), mi.row_indices.data(),
-                col_idx.col_primanota_id);
-
-            months.push_back(std::move(mi));
+                bind_data.source_rows.size(), nullptr, state.col_idx.col_primanota_id);
         }
+
         auto uuid_end = std::chrono::high_resolution_clock::now();
         double uuid_dur = std::chrono::duration<double>(uuid_end - uuid_start).count();
         AddSuccessResult(bind_data, "TIMING:uuid_gen", static_cast<int64_t>(bind_data.source_rows.size()), "", uuid_dur);
 
-        // --- Phase 2: Populate local staging table ---
+        state.phase = ExecutionPhase::POPULATE_STAGING;
+        state.progress = 50.0;
+        OutputResults(bind_data, state, output);
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // POPULATE_STAGING  (50 → 65%)
+    // -----------------------------------------------------------------
+    case ExecutionPhase::POPULATE_STAGING: {
+        auto &db = DatabaseInstance::GetDatabase(context);
         auto staging_start = std::chrono::high_resolution_clock::now();
-        Connection staging_conn(db);
-        if (!CreateStagingTable(staging_conn, error_msg)) {
+
+        state.staging_conn = make_uniq<Connection>(db);
+        if (!CreateStagingTable(*state.staging_conn, error_msg)) {
+            state.staging_conn.reset();
             AddErrorResult(bind_data, "ERROR", error_msg);
-            OutputResults(bind_data, global_state, output);
+            state.phase = ExecutionPhase::OUTPUT_RESULTS;
+            OutputResults(bind_data, state, output);
             return;
         }
 
         string timestamp = GetCurrentTimestamp();
         string date_fallback = timestamp.substr(0, 10);
 
-        for (auto &mi : months) {
-            string vorlauf_datum_bis = mi.date_to + " 00:00:00";
-
-            if (!PopulateStagingTable(staging_conn, bind_data,
-                                       &mi.row_indices, mi.primanota_ids,
-                                       mi.vorlauf_id, bind_data.gui_verfahren_id,
+        if (bind_data.monatsvorlauf) {
+            for (auto &mi : state.months) {
+                string vorlauf_datum_bis = mi.date_to + " 00:00:00";
+                if (!PopulateStagingTable(*state.staging_conn, bind_data,
+                                           &mi.row_indices, mi.primanota_ids,
+                                           mi.vorlauf_id, bind_data.gui_verfahren_id,
+                                           bind_data.str_angelegt, vorlauf_datum_bis,
+                                           timestamp, date_fallback, state.col_idx, error_msg,
+                                           mi.year_month)) {
+                    CleanupAndError(state, bind_data, output, "ERROR", error_msg);
+                    return;
+                }
+            }
+        } else {
+            string vorlauf_datum_bis = state.date_to + " 00:00:00";
+            if (!PopulateStagingTable(*state.staging_conn, bind_data,
+                                       nullptr, state.primanota_ids,
+                                       state.vorlauf_id, bind_data.gui_verfahren_id,
                                        bind_data.str_angelegt, vorlauf_datum_bis,
-                                       timestamp, date_fallback, col_idx, error_msg,
-                                       mi.year_month)) {
-                DropStagingTable(staging_conn);
-                AddErrorResult(bind_data, "ERROR", error_msg);
-                OutputResults(bind_data, global_state, output);
+                                       timestamp, date_fallback, state.col_idx, error_msg)) {
+                CleanupAndError(state, bind_data, output, "ERROR", error_msg);
                 return;
             }
         }
+
         auto staging_end = std::chrono::high_resolution_clock::now();
         double staging_dur = std::chrono::duration<double>(staging_end - staging_start).count();
         AddSuccessResult(bind_data, "TIMING:staging", static_cast<int64_t>(bind_data.source_rows.size()), "", staging_dur);
 
-        // --- Phase 3a: Batch Vorlauf creation (~3 round-trips) ---
-        auto vorlauf_batch_start = std::chrono::high_resolution_clock::now();
-        {
+        state.phase = ExecutionPhase::VORLAUF_RECORDS;
+        state.progress = 65.0;
+        OutputResults(bind_data, state, output);
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // VORLAUF_RECORDS  (65 → 80%)
+    // -----------------------------------------------------------------
+    case ExecutionPhase::VORLAUF_RECORDS: {
+        auto &db = DatabaseInstance::GetDatabase(context);
+
+        if (bind_data.monatsvorlauf) {
+            // Batch Vorlauf: BEGIN TX → batch insert/update → COMMIT
+            auto vorlauf_batch_start = std::chrono::high_resolution_clock::now();
+
             Connection txn_conn(db);
             if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
-                DropStagingTable(staging_conn);
-                AddErrorResult(bind_data, "ERROR", "Failed to begin vorlauf transaction: " + error_msg);
-                OutputResults(bind_data, global_state, output);
+                CleanupAndError(state, bind_data, output, "ERROR", "Failed to begin vorlauf transaction: " + error_msg);
                 return;
             }
 
@@ -1604,21 +1751,19 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             if (!BatchCreateVorlaufRecords(txn_conn, bind_data.secret_name,
                                             bind_data.gui_verfahren_id,
                                             bind_data.lng_kanzlei_konten_rahmen_id,
-                                            bind_data.str_angelegt, months,
+                                            bind_data.str_angelegt, state.months,
                                             vorlauf_results, error_msg)) {
-                DropStagingTable(staging_conn);
-                RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg);
+                string rb_err;
+                ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rb_err);
+                CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg);
                 return;
             }
 
             if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
-                DropStagingTable(staging_conn);
-                AddErrorResult(bind_data, "ERROR", "Failed to commit vorlauf batch: " + error_msg);
-                OutputResults(bind_data, global_state, output);
+                CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit vorlauf batch: " + error_msg);
                 return;
             }
 
-            // Report vorlauf results
             for (auto &vr : vorlauf_results) {
                 if (vr.inserted) {
                     AddSuccessResult(bind_data, "tblVorlauf", 1, vr.vorlauf_id, vr.duration);
@@ -1626,203 +1771,155 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, vr.vorlauf_id, vr.duration);
                 }
             }
-        }
-        auto vorlauf_batch_end = std::chrono::high_resolution_clock::now();
-        double vorlauf_batch_dur = std::chrono::duration<double>(vorlauf_batch_end - vorlauf_batch_start).count();
-        AddSuccessResult(bind_data, "TIMING:vorlauf_batch", static_cast<int64_t>(months.size()), "", vorlauf_batch_dur);
 
-        // --- Phase 3b: Parallel per-month Primanota transfer ---
-        auto transfer_start = std::chrono::high_resolution_clock::now();
-        size_t max_threads = std::min(months.size(), static_cast<size_t>(4));
+            auto vorlauf_batch_end = std::chrono::high_resolution_clock::now();
+            double vorlauf_batch_dur = std::chrono::duration<double>(vorlauf_batch_end - vorlauf_batch_start).count();
+            AddSuccessResult(bind_data, "TIMING:vorlauf_batch", static_cast<int64_t>(state.months.size()), "", vorlauf_batch_dur);
 
-        vector<MonthTransferResult> transfer_results;
-        ParallelTransferPrimanota(db, bind_data.secret_name, months, max_threads, transfer_results);
+        } else {
+            // Single-vorlauf: BEGIN TX → insert/update (TX stays open for TRANSFER phase)
+            state.txn_conn = make_uniq<Connection>(db);
 
-        DropStagingTable(staging_conn);
-        auto transfer_end = std::chrono::high_resolution_clock::now();
-        double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
-
-        // Report per-month transfer results
-        int64_t total_transferred = 0;
-        bool any_failed = false;
-        for (auto &tr : transfer_results) {
-            if (tr.success) {
-                total_transferred += tr.rows_transferred;
-                AddSuccessResult(bind_data, "tblPrimanota", tr.rows_transferred, tr.vorlauf_id, tr.duration);
-            } else {
-                any_failed = true;
-                AddErrorResult(bind_data, "tblPrimanota", tr.error_message, tr.vorlauf_id);
+            if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
+                state.txn_conn.reset();
+                CleanupAndError(state, bind_data, output, "ERROR", "Failed to begin transaction: " + error_msg);
+                return;
             }
+
+            // Derive bezeichnung from MSSQL
+            string derived_bezeichnung;
+            if (!DeriveBezeichnungFromMssql(*state.txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id,
+                                             state.date_from, state.date_to, derived_bezeichnung, error_msg)) {
+                CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
+                return;
+            }
+            if (!derived_bezeichnung.empty()) {
+                state.bezeichnung = std::move(derived_bezeichnung);
+            }
+
+            // Check if vorlauf exists (for source-provided IDs)
+            if (state.vorlauf_id_from_source) {
+                bool exists = false;
+                if (!VorlaufExists(*state.txn_conn, bind_data.secret_name, state.vorlauf_id, exists, error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
+                    return;
+                }
+                state.skip_vorlauf_insert = exists;
+            }
+
+            // Insert or update Vorlauf
+            if (!state.skip_vorlauf_insert) {
+                auto vorlauf_start = std::chrono::high_resolution_clock::now();
+                if (!InsertVorlauf(*state.txn_conn, bind_data, state.vorlauf_id, state.date_from, state.date_to, state.bezeichnung, error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
+                    return;
+                }
+                auto vorlauf_end = std::chrono::high_resolution_clock::now();
+                double vorlauf_dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+                AddSuccessResult(bind_data, "tblVorlauf", 1, state.vorlauf_id, vorlauf_dur);
+            } else {
+                auto vorlauf_start = std::chrono::high_resolution_clock::now();
+                if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name, state.vorlauf_id, state.date_to, state.bezeichnung, bind_data.str_angelegt, error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
+                    return;
+                }
+                auto vorlauf_end = std::chrono::high_resolution_clock::now();
+                double vorlauf_dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
+                AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, state.vorlauf_id, vorlauf_dur);
+            }
+            // txn_conn stays open — TRANSFER_PRIMANOTA will COMMIT
         }
 
-        if (any_failed) {
-            AddErrorResult(bind_data, "WARNING", "Some months failed to transfer — see per-month results above");
+        state.phase = ExecutionPhase::TRANSFER_PRIMANOTA;
+        state.progress = 80.0;
+        OutputResults(bind_data, state, output);
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // TRANSFER_PRIMANOTA  (80 → 95%)
+    // -----------------------------------------------------------------
+    case ExecutionPhase::TRANSFER_PRIMANOTA: {
+        auto &db = DatabaseInstance::GetDatabase(context);
+        auto transfer_start = std::chrono::high_resolution_clock::now();
+
+        if (bind_data.monatsvorlauf) {
+            // Parallel per-month transfer (each month has its own TX)
+            size_t max_threads = std::min(state.months.size(), static_cast<size_t>(4));
+            vector<MonthTransferResult> transfer_results;
+            ParallelTransferPrimanota(db, bind_data.secret_name, state.months, max_threads, transfer_results);
+
+            DropStagingTable(*state.staging_conn);
+            state.staging_conn.reset();
+
+            auto transfer_end = std::chrono::high_resolution_clock::now();
+            double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+
+            int64_t total_transferred = 0;
+            bool any_failed = false;
+            for (auto &tr : transfer_results) {
+                if (tr.success) {
+                    total_transferred += tr.rows_transferred;
+                    AddSuccessResult(bind_data, "tblPrimanota", tr.rows_transferred, tr.vorlauf_id, tr.duration);
+                } else {
+                    any_failed = true;
+                    AddErrorResult(bind_data, "tblPrimanota", tr.error_message, tr.vorlauf_id);
+                }
+            }
+            if (any_failed) {
+                AddErrorResult(bind_data, "WARNING", "Some months failed to transfer — see per-month results above");
+            }
+            AddSuccessResult(bind_data, "tblPrimanota (parallel)", total_transferred, "", transfer_dur);
+
+        } else {
+            // Single-vorlauf: bulk transfer within open transaction
+            if (!BulkTransferPrimanota(*state.txn_conn, bind_data.secret_name, error_msg)) {
+                CleanupAndError(state, bind_data, output, "tblPrimanota", error_msg, state.vorlauf_id);
+                return;
+            }
+
+            // Commit
+            if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+                // Transaction failed to commit — staging still needs cleanup
+                state.txn_conn.reset();
+                CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit: " + error_msg, state.vorlauf_id);
+                return;
+            }
+
+            DropStagingTable(*state.staging_conn);
+            state.staging_conn.reset();
+            state.txn_conn.reset();
+
+            auto transfer_end = std::chrono::high_resolution_clock::now();
+            double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+            AddSuccessResult(bind_data, "tblPrimanota (bulk)", static_cast<int64_t>(bind_data.source_rows.size()), state.vorlauf_id, transfer_dur);
         }
 
-        AddSuccessResult(bind_data, "tblPrimanota (parallel)", total_transferred, "", transfer_dur);
+        state.phase = ExecutionPhase::FINALIZE;
+        state.progress = 95.0;
+        OutputResults(bind_data, state, output);
+        return;
+    }
 
+    // -----------------------------------------------------------------
+    // FINALIZE  (95 → 100%)  —  total timing
+    // -----------------------------------------------------------------
+    case ExecutionPhase::FINALIZE: {
         auto total_end = std::chrono::high_resolution_clock::now();
-        double total_dur = std::chrono::duration<double>(total_end - total_start).count();
-        AddSuccessResult(bind_data, "TIMING:total", static_cast<int64_t>(bind_data.source_rows.size()), "", total_dur);
+        double total_dur = std::chrono::duration<double>(total_end - state.total_start).count();
+        string vid = bind_data.monatsvorlauf ? "" : state.vorlauf_id;
+        AddSuccessResult(bind_data, "TIMING:total", static_cast<int64_t>(bind_data.source_rows.size()), vid, total_dur);
 
-        OutputResults(bind_data, global_state, output);
+        state.phase = ExecutionPhase::OUTPUT_RESULTS;
+        state.progress = 100.0;
+        OutputResults(bind_data, state, output);
         return;
     }
 
-    // =========================================================================
-    // Step 4: Prepare Vorlauf data (single Vorlauf, monatsvorlauf=false)
-    // =========================================================================
-
-    string vorlauf_id;
-    bool vorlauf_id_from_source = false;
-
-    if (!bind_data.generate_vorlauf_id) {
-        idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
-        if (vorlauf_id_col != DConstants::INVALID_INDEX
-            && !bind_data.source_rows.empty()
-            && vorlauf_id_col < bind_data.source_rows[0].size()
-            && !bind_data.source_rows[0][vorlauf_id_col].IsNull()) {
-            vorlauf_id = bind_data.source_rows[0][vorlauf_id_col].ToString();
-            vorlauf_id_from_source = true;
-        }
-    }
-
-    if (vorlauf_id.empty()) {
-        vorlauf_id = GenerateVorlaufUUID(bind_data.row_keys, bind_data.gui_verfahren_id);
-    }
-
-    auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
-    string date_from = date_range.first;
-    string date_to = date_range.second;
-
-    if (date_from.empty()) {
-        date_from = GetCurrentMonthStart();
-    }
-    if (date_to.empty()) {
-        date_to = GetCurrentDate();
-    }
-
-    string bezeichnung = DeriveVorlaufBezeichnung(date_from, date_to);
-
-    // =========================================================================
-    // Steps 5-7: Staging table + MSSQL transaction
-    // =========================================================================
-
-    // Phase 1: Pre-compute primanota IDs
-    auto uuid_start = std::chrono::high_resolution_clock::now();
-    auto primanota_ids = PreComputePrimanotaIds(
-        bind_data.source_rows, bind_data.row_keys,
-        bind_data.source_rows.size(), nullptr, col_idx.col_primanota_id);
-    auto uuid_end = std::chrono::high_resolution_clock::now();
-
-    // Phase 2: Populate staging table
-    auto staging_start = std::chrono::high_resolution_clock::now();
-    Connection staging_conn(db);
-    if (!CreateStagingTable(staging_conn, error_msg)) {
-        AddErrorResult(bind_data, "ERROR", error_msg);
-        OutputResults(bind_data, global_state, output);
+    default:
+        output.SetCardinality(0);
         return;
     }
-
-    string timestamp = GetCurrentTimestamp();
-    string date_fallback = timestamp.substr(0, 10);
-    string vorlauf_datum_bis = date_to + " 00:00:00";
-
-    if (!PopulateStagingTable(staging_conn, bind_data,
-                               nullptr, primanota_ids,
-                               vorlauf_id, bind_data.gui_verfahren_id,
-                               bind_data.str_angelegt, vorlauf_datum_bis,
-                               timestamp, date_fallback, col_idx, error_msg)) {
-        DropStagingTable(staging_conn);
-        AddErrorResult(bind_data, "ERROR", error_msg);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-    auto staging_end = std::chrono::high_resolution_clock::now();
-    double staging_dur = std::chrono::duration<double>(staging_end - staging_start).count();
-    AddSuccessResult(bind_data, "TIMING:staging", static_cast<int64_t>(bind_data.source_rows.size()), "", staging_dur);
-
-    // Phase 3: MSSQL transaction
-    Connection txn_conn(db);
-
-    if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
-        DropStagingTable(staging_conn);
-        AddErrorResult(bind_data, "ERROR", "Failed to begin transaction: " + error_msg);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-
-    string derived_bezeichnung;
-    if (!DeriveBezeichnungFromMssql(txn_conn, bind_data.secret_name, bind_data.gui_verfahren_id, date_from, date_to, derived_bezeichnung, error_msg)) {
-        DropStagingTable(staging_conn);
-        RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
-        return;
-    }
-    if (!derived_bezeichnung.empty()) {
-        bezeichnung = std::move(derived_bezeichnung);
-    }
-
-    // Step 5: Insert Vorlauf (or update if already exists)
-    bool skip_vorlauf_insert = false;
-    if (vorlauf_id_from_source) {
-        bool exists = false;
-        if (!VorlaufExists(txn_conn, bind_data.secret_name, vorlauf_id, exists, error_msg)) {
-            DropStagingTable(staging_conn);
-            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
-            return;
-        }
-        skip_vorlauf_insert = exists;
-    }
-
-    double vorlauf_duration = 0.0;
-    if (!skip_vorlauf_insert) {
-        auto vorlauf_start = std::chrono::high_resolution_clock::now();
-        if (!InsertVorlauf(txn_conn, bind_data, vorlauf_id, date_from, date_to, bezeichnung, error_msg)) {
-            DropStagingTable(staging_conn);
-            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
-            return;
-        }
-        auto vorlauf_end = std::chrono::high_resolution_clock::now();
-        vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-        AddSuccessResult(bind_data, "tblVorlauf", 1, vorlauf_id, vorlauf_duration);
-    } else {
-        auto vorlauf_start = std::chrono::high_resolution_clock::now();
-        if (!UpdateVorlauf(txn_conn, bind_data.secret_name, vorlauf_id, date_to, bezeichnung, bind_data.str_angelegt, error_msg)) {
-            DropStagingTable(staging_conn);
-            RollbackAndError(txn_conn, bind_data, global_state, output, "tblVorlauf", error_msg, vorlauf_id);
-            return;
-        }
-        auto vorlauf_end = std::chrono::high_resolution_clock::now();
-        vorlauf_duration = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-        AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, vorlauf_id, vorlauf_duration);
-    }
-
-    // Step 6: Bulk transfer Primanota rows
-    auto transfer_start = std::chrono::high_resolution_clock::now();
-    if (!BulkTransferPrimanota(txn_conn, bind_data.secret_name, error_msg)) {
-        DropStagingTable(staging_conn);
-        RollbackAndError(txn_conn, bind_data, global_state, output, "tblPrimanota", error_msg, vorlauf_id);
-        return;
-    }
-
-    // Step 7: Commit transaction
-    if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
-        DropStagingTable(staging_conn);
-        AddErrorResult(bind_data, "ERROR", "Failed to commit: " + error_msg, vorlauf_id);
-        OutputResults(bind_data, global_state, output);
-        return;
-    }
-    DropStagingTable(staging_conn);
-
-    auto transfer_end = std::chrono::high_resolution_clock::now();
-    double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
-    AddSuccessResult(bind_data, "tblPrimanota (bulk)", static_cast<int64_t>(bind_data.source_rows.size()), vorlauf_id, transfer_dur);
-
-    auto total_end = std::chrono::high_resolution_clock::now();
-    double total_dur = std::chrono::duration<double>(total_end - total_start).count();
-    AddSuccessResult(bind_data, "TIMING:total", static_cast<int64_t>(bind_data.source_rows.size()), vorlauf_id, total_dur);
-
-    OutputResults(bind_data, global_state, output);
 }
 
 // ============================================================================
@@ -1831,6 +1928,9 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
 void RegisterIntoWzFunction(DatabaseInstance &db) {
     TableFunction into_wz_func("into_wz", {}, IntoWzExecute, IntoWzBind, IntoWzInitGlobal);
+
+    // Enable DuckDB's built-in progress bar for this table function
+    into_wz_func.table_scan_progress = IntoWzProgress;
 
     // Add named parameters
     into_wz_func.named_parameters["secret"] = LogicalType::VARCHAR;
