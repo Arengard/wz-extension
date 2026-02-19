@@ -10,8 +10,15 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/appender.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "mbedtls_wrapper.hpp"
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -27,7 +34,8 @@ namespace duckdb {
 
 static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 1000;
 static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
-static constexpr size_t MSSQL_INSERT_BATCH_SIZE = 500;  // rows per multi-row INSERT VALUES
+static constexpr size_t MSSQL_INSERT_BATCH_SIZE = 1000;   // rows per INSERT VALUES (MSSQL max)
+static constexpr size_t MSSQL_STMTS_PER_ROUNDTRIP = 5;   // INSERT statements per conn.Query()
 
 // Staging table name for bulk Primanota transfer
 static const char *STAGING_TABLE_NAME = "__wz_primanota_staging";
@@ -1030,14 +1038,281 @@ static bool PopulateStagingTable(Connection &staging_conn,
 }
 
 // ============================================================================
-// Bulk transfer: INSERT INTO ms.dbo.tblPrimanota SELECT * FROM staging table.
-// Single operation lets DuckDB's MSSQL extension handle native bulk transfer.
+// BCP-based bulk transfer: export staging to CSV, invoke bcp.exe
+// ============================================================================
+
+// Parse MSSQL connection string into components.
+// Supports both ODBC-style "Server=x;Database=y;Uid=z;Pwd=w" and
+// key variations (UID/User ID, PWD/Password, etc.)
+struct MssqlConnInfo {
+    string server;
+    string database;
+    string user;
+    string password;
+    bool trusted;  // Windows authentication
+};
+
+static bool ParseConnectionString(const string &conn_str, MssqlConnInfo &info) {
+    info.trusted = false;
+    // Split by semicolons, parse key=value pairs
+    std::istringstream ss(conn_str);
+    string token;
+    while (std::getline(ss, token, ';')) {
+        auto eq_pos = token.find('=');
+        if (eq_pos == string::npos) continue;
+        string key = token.substr(0, eq_pos);
+        string val = token.substr(eq_pos + 1);
+        // Trim whitespace
+        while (!key.empty() && key.front() == ' ') key.erase(key.begin());
+        while (!key.empty() && key.back() == ' ') key.pop_back();
+        // Case-insensitive key matching
+        string lower_key;
+        lower_key.resize(key.size());
+        std::transform(key.begin(), key.end(), lower_key.begin(), ::tolower);
+
+        if (lower_key == "server" || lower_key == "data source") {
+            info.server = val;
+        } else if (lower_key == "database" || lower_key == "initial catalog") {
+            info.database = val;
+        } else if (lower_key == "uid" || lower_key == "user id" || lower_key == "user") {
+            info.user = val;
+        } else if (lower_key == "pwd" || lower_key == "password") {
+            info.password = val;
+        } else if (lower_key == "trusted_connection" || lower_key == "integrated security") {
+            string lower_val;
+            lower_val.resize(val.size());
+            std::transform(val.begin(), val.end(), lower_val.begin(), ::tolower);
+            if (lower_val == "yes" || lower_val == "true" || lower_val == "sspi") {
+                info.trusted = true;
+            }
+        }
+    }
+    return !info.server.empty() && !info.database.empty() &&
+           (info.trusted || (!info.user.empty() && !info.password.empty()));
+}
+
+// Try to extract MSSQL connection info from a DuckDB secret using the C++ SecretManager API.
+// This bypasses the duckdb_secrets(redact=false) SQL function which is blocked by default in v1.4+.
+static bool GetMssqlConnInfo(ClientContext &context, const string &secret_name, MssqlConnInfo &info) {
+    auto &db = DatabaseInstance::GetDatabase(context);
+    auto &secret_manager = SecretManager::Get(db);
+    auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+
+    // Helper: extract host/database/user/password from a KeyValueSecret
+    auto extract_info = [&](const KeyValueSecret *kv) -> bool {
+        info = MssqlConnInfo();  // reset
+        Value val;
+        if (kv->TryGetValue("host", val) && !val.IsNull()) info.server = val.ToString();
+        if (kv->TryGetValue("database", val) && !val.IsNull()) info.database = val.ToString();
+        if (kv->TryGetValue("user", val) && !val.IsNull()) info.user = val.ToString();
+        if (kv->TryGetValue("password", val) && !val.IsNull()) info.password = val.ToString();
+        // Append non-default port to server (bcp uses "server,port" syntax)
+        if (kv->TryGetValue("port", val) && !val.IsNull()) {
+            string port_str = val.ToString();
+            if (!port_str.empty() && port_str != "1433") {
+                info.server += "," + port_str;
+            }
+        }
+        return !info.server.empty() && !info.database.empty() &&
+               (info.trusted || (!info.user.empty() && !info.password.empty()));
+    };
+
+    // Try 1: Look up secret by exact name (works when user passes the actual secret name)
+    auto entry = secret_manager.GetSecretByName(transaction, secret_name);
+    if (entry) {
+        auto *kv = dynamic_cast<const KeyValueSecret *>(entry->secret.get());
+        if (kv && extract_info(kv)) return true;
+    }
+
+    // Try 2: Scan all secrets for the first MSSQL-type secret
+    // (handles the common case where secret param is the DB alias, not the secret name)
+    auto all = secret_manager.AllSecrets(transaction);
+    for (auto &e : all) {
+        string type = e.secret->GetType();
+        std::transform(type.begin(), type.end(), type.begin(), ::tolower);
+        if (type == "mssql") {
+            auto *kv = dynamic_cast<const KeyValueSecret *>(e.secret.get());
+            if (kv && extract_info(kv)) return true;
+        }
+    }
+
+    return false;
+}
+
+// Export staging table to a tab-separated file for bcp.
+static bool ExportStagingToCsv(Connection &staging_conn, const string &csv_path,
+                                 string &error_message,
+                                 const string &year_month_filter = "") {
+    string select_cols = string(PRIMANOTA_COLUMN_LIST);
+    string sql = "COPY (SELECT " + select_cols + " FROM " + STAGING_TABLE_NAME;
+    if (!year_month_filter.empty()) {
+        sql += " WHERE year_month = '" + EscapeSqlString(year_month_filter) + "'";
+    }
+    sql += ") TO '" + csv_path + "' (DELIMITER '\t', HEADER false, NULL '', QUOTE '')";
+
+    auto result = staging_conn.Query(sql);
+    if (result->HasError()) {
+        error_message = "Failed to export staging to CSV: " + result->GetError();
+        return false;
+    }
+    return true;
+}
+
+// Generate a BCP format file for tblPrimanota character-mode import.
+// Uses \n (LF) as the row terminator to match DuckDB COPY TO output.
+// Without this, BCP defaults to \r\n which misparses the last column.
+static bool GenerateBcpFormatFile(const string &fmt_path, string &error_message) {
+    static const char *COL_NAMES[] = {
+        "lngTimestamp", "strAngelegt", "dtmAngelegt", "strGeaendert", "dtmGeaendert",
+        "guiPrimanotaID", "guiVorlaufID", "lngStatus", "lngZeilenNr", "lngEingabeWaehrungID",
+        "lngBu", "decGegenkontoNr", "decKontoNr", "decEaKontoNr", "dtmVorlaufDatumBis",
+        "dtmBelegDatum", "ysnSoll", "curEingabeBetrag", "curBasisBetrag", "curSkontoBetrag",
+        "curSkontoBasisBetrag", "decKostMenge", "decWaehrungskurs", "strBeleg1", "strBeleg2",
+        "strBuchText", "strKost1", "strKost2", "strEuLand", "strUstId",
+        "decEuSteuersatz", "dtmZusatzDatum", "guiVerfahrenID", "decEaSteuersatz",
+        "ysnEaTransaktionenManuell", "decEaNummer", "lngSachverhalt13b", "dtmLeistung",
+        "ysnIstversteuerungInSollversteuerung", "lngSkontoSachverhaltWarenRHB",
+        "ysnVStBeiZahlung", "guiParentPrimanota", "ysnGeneralUmkehr", "decSteuersatzManuell",
+        "ysnMitUrsprungsland", "strUrsprungsland", "strUrsprungslandUstId", "decUrsprungslandSteuersatz"
+    };
+    static constexpr int NUM_COLS = 48;
+
+    std::ofstream f(fmt_path);
+    if (!f.is_open()) {
+        error_message = "Failed to create BCP format file: " + fmt_path;
+        return false;
+    }
+
+    f << "14.0\n";
+    f << NUM_COLS << "\n";
+    for (int i = 0; i < NUM_COLS; i++) {
+        const char *terminator = (i < NUM_COLS - 1) ? "\\t" : "\\n";
+        f << (i + 1) << "       SQLCHAR       0       8000      \""
+          << terminator << "\"     " << (i + 1) << "     " << COL_NAMES[i] << "       \"\"\n";
+    }
+
+    f.close();
+    return true;
+}
+
+// Invoke bcp.exe to bulk-load a data file into tblPrimanota using a format file.
+// Returns true on success, sets error_message on failure.
+static bool InvokeBcp(const MssqlConnInfo &info, const string &csv_path,
+                       const string &fmt_path,
+                       string &error_message, int64_t &rows_loaded) {
+    rows_loaded = 0;
+
+    // Build bcp command using format file for correct \n row terminator
+    // bcp <db>.dbo.tblPrimanota in <file> -S <server> -f <fmt> -k -b 5000
+    string cmd = "bcp " + info.database + ".dbo.tblPrimanota in \"" + csv_path + "\"" +
+                 " -S " + info.server +
+                 " -f \"" + fmt_path + "\" -k -b 5000";
+
+    if (info.trusted) {
+        cmd += " -T";
+    } else {
+        cmd += " -U " + info.user + " -P " + info.password;
+    }
+
+    // Redirect stderr to stdout to capture all output
+    cmd += " 2>&1";
+
+    // Execute and capture output
+    string output;
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) {
+        error_message = "Failed to execute bcp command";
+        return false;
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    int exit_code = _pclose(pipe);
+#else
+    int exit_code = pclose(pipe);
+#endif
+
+    if (exit_code != 0) {
+        // Truncate output for error message
+        if (output.size() > 500) output = output.substr(0, 500) + "...";
+        error_message = "bcp failed (exit " + std::to_string(exit_code) + "): " + output;
+        return false;
+    }
+
+    // Parse "N rows copied" from bcp output
+    auto pos = output.find("rows copied");
+    if (pos != string::npos) {
+        // Walk backwards from "rows copied" to find the number
+        auto num_end = pos;
+        while (num_end > 0 && output[num_end - 1] == ' ') num_end--;
+        auto num_start = num_end;
+        while (num_start > 0 && std::isdigit(output[num_start - 1])) num_start--;
+        if (num_start < num_end) {
+            rows_loaded = std::stoll(output.substr(num_start, num_end - num_start));
+        }
+    }
+
+    return true;
+}
+
+// Full bcp transfer: export staging → bcp → cleanup.
+// Returns false if bcp is not available or fails (caller should fall back).
+static bool BcpTransferPrimanota(Connection &staging_conn, ClientContext &context,
+                                   const string &secret_name,
+                                   string &error_message,
+                                   int64_t &rows_transferred,
+                                   const string &year_month_filter = "") {
+    rows_transferred = 0;
+
+    // 1. Get connection info from secret via C++ SecretManager API
+    MssqlConnInfo conn_info;
+    if (!GetMssqlConnInfo(context, secret_name, conn_info)) {
+        error_message = "Could not extract MSSQL connection info from secret";
+        return false;
+    }
+
+    // 2. Export staging table to temp TSV
+    auto temp_dir = std::filesystem::temp_directory_path();
+    string csv_path = (temp_dir / "wz_primanota_staging.csv").string();
+    string fmt_path = (temp_dir / "wz_primanota_staging.fmt").string();
+
+    if (!ExportStagingToCsv(staging_conn, csv_path, error_message, year_month_filter)) {
+        return false;
+    }
+
+    // 3. Generate format file (defines \n row terminator to match DuckDB export)
+    if (!GenerateBcpFormatFile(fmt_path, error_message)) {
+        std::filesystem::remove(csv_path);
+        return false;
+    }
+
+    // 4. Invoke bcp with format file
+    bool success = InvokeBcp(conn_info, csv_path, fmt_path, error_message, rows_transferred);
+
+    // 5. Cleanup temp files
+    std::filesystem::remove(csv_path);
+    std::filesystem::remove(fmt_path);
+
+    return success;
+}
+
+// ============================================================================
+// Fallback bulk transfer: batched multi-row INSERT VALUES
 // ============================================================================
 
 // Read rows from the staging table and insert into MSSQL via batched
-// multi-row INSERT VALUES statements.  The INSERT INTO ... SELECT approach
-// goes through DuckDB's MSSQL extension which does row-by-row TDS inserts.
-// Building VALUES tuples ourselves packs ~500 rows per round-trip instead.
+// multi-row INSERT VALUES statements.  DuckDB's MSSQL extension sends
+// INSERT INTO SELECT as row-by-row TDS inserts.  Building VALUES tuples
+// with 1000 rows/statement and 5 statements/round-trip gives ~19 round-trips
+// for 95k rows instead of 95k.
 static bool BulkTransferPrimanota(Connection &txn_conn,
                                    Connection &staging_conn,
                                    const string &db_name,
@@ -1059,19 +1334,36 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
     string insert_prefix = string("INSERT INTO ") + db_name + ".dbo.tblPrimanota (" +
                            PRIMANOTA_COLUMN_LIST + ") VALUES ";
 
-    // Iterate result chunks and build batched INSERT VALUES
+    // Accumulate complete INSERT statements, send multiple per round-trip
+    vector<string> pending_stmts;
     idx_t rows_in_batch = 0;
+    // ~200 bytes per row × 1000 rows = ~200KB per statement
     string values_sql;
+    values_sql.reserve(256 * 1024);
 
-    auto flush_batch = [&]() -> bool {
-        if (rows_in_batch == 0) return true;
-        string sql = insert_prefix + values_sql;
-        if (!ExecuteMssqlStatementWithConn(txn_conn, sql, error_message)) {
+    auto flush_stmt = [&]() {
+        if (rows_in_batch == 0) return;
+        pending_stmts.push_back(insert_prefix + values_sql);
+        rows_in_batch = 0;
+        values_sql.clear();
+    };
+
+    auto flush_roundtrip = [&]() -> bool {
+        if (pending_stmts.empty()) return true;
+        // Concatenate statements with "; " for multi-statement batch
+        string batch;
+        size_t total_len = 0;
+        for (auto &s : pending_stmts) total_len += s.size() + 2;
+        batch.reserve(total_len);
+        for (size_t i = 0; i < pending_stmts.size(); i++) {
+            if (i > 0) batch += "; ";
+            batch += pending_stmts[i];
+        }
+        pending_stmts.clear();
+        if (!ExecuteMssqlStatementWithConn(txn_conn, batch, error_message)) {
             error_message = "Failed to insert batch into tblPrimanota: " + error_message;
             return false;
         }
-        rows_in_batch = 0;
-        values_sql.clear();
         return true;
     };
 
@@ -1079,41 +1371,41 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
         idx_t row_count = chunk.size();
         for (idx_t row = 0; row < row_count; row++) {
             if (rows_in_batch > 0) {
-                values_sql += ",";
+                values_sql += ',';
             }
-            values_sql += "(";
+            values_sql += '(';
             for (idx_t col = 0; col < col_count; col++) {
-                if (col > 0) values_sql += ",";
+                if (col > 0) values_sql += ',';
                 Value val = chunk.data[col].GetValue(row);
                 if (val.IsNull()) {
                     values_sql += "NULL";
                 } else {
-                    string str_val = val.ToString();
-                    // INTEGER columns: lngTimestamp, lngStatus, lngZeilenNr,
-                    // lngEingabeWaehrungID, lngBu, ysnSoll, ysnEaTransaktionenManuell,
-                    // lngSachverhalt13b, ysnIstversteuerungInSollversteuerung,
-                    // lngSkontoSachverhaltWarenRHB, ysnVStBeiZahlung, ysnGeneralUmkehr,
-                    // ysnMitUrsprungsland
                     auto &type = staging_result->types[col];
                     if (type == LogicalType::INTEGER || type == LogicalType::BIGINT ||
                         type == LogicalType::SMALLINT || type == LogicalType::TINYINT) {
-                        values_sql += str_val;
+                        values_sql += val.ToString();
                     } else {
-                        values_sql += "'" + EscapeSqlString(str_val) + "'";
+                        values_sql += '\'';
+                        values_sql += EscapeSqlString(val.ToString());
+                        values_sql += '\'';
                     }
                 }
             }
-            values_sql += ")";
+            values_sql += ')';
             rows_in_batch++;
 
             if (rows_in_batch >= MSSQL_INSERT_BATCH_SIZE) {
-                if (!flush_batch()) return false;
+                flush_stmt();
+                if (pending_stmts.size() >= MSSQL_STMTS_PER_ROUNDTRIP) {
+                    if (!flush_roundtrip()) return false;
+                }
             }
         }
     }
 
     // Flush remaining rows
-    return flush_batch();
+    flush_stmt();
+    return flush_roundtrip();
 }
 
 // ============================================================================
@@ -1915,77 +2207,122 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         auto &db = DatabaseInstance::GetDatabase(context);
 
         if (bind_data.monatsvorlauf) {
-            // Sequential per-month transfer with batched multi-row INSERT VALUES.
             auto transfer_start = std::chrono::high_resolution_clock::now();
             int64_t total_transferred = 0;
+            bool used_bcp = false;
 
-            Connection conn(db);
-            for (size_t mi_idx = 0; mi_idx < state.months.size(); mi_idx++) {
-                auto &mi = state.months[mi_idx];
-                auto month_start = std::chrono::high_resolution_clock::now();
+            // Try bcp first — orders of magnitude faster than SQL INSERT
+            string bcp_err;
+            int64_t bcp_rows = 0;
 
-                if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", error_msg)) {
-                    CleanupAndError(state, bind_data, output, "tblPrimanota",
-                        "Failed to begin transaction for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                    return;
+            // bcp transfers all months at once (no year_month filter needed)
+            if (BcpTransferPrimanota(*state.staging_conn, context, bind_data.secret_name,
+                                      bcp_err, bcp_rows)) {
+                used_bcp = true;
+                total_transferred = bcp_rows;
+                auto bcp_end = std::chrono::high_resolution_clock::now();
+                double bcp_dur = std::chrono::duration<double>(bcp_end - transfer_start).count();
+                AddSuccessResult(bind_data, "tblPrimanota (bcp)", total_transferred, "", bcp_dur);
+                state.progress = 95.0;
+            } else {
+                // bcp failed — fall back to batched INSERT VALUES
+                AddSuccessResult(bind_data, "INFO:bcp_fallback", 0, "", 0);
+
+                Connection conn(db);
+                for (size_t mi_idx = 0; mi_idx < state.months.size(); mi_idx++) {
+                    auto &mi = state.months[mi_idx];
+                    auto month_start = std::chrono::high_resolution_clock::now();
+
+                    if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", error_msg)) {
+                        CleanupAndError(state, bind_data, output, "tblPrimanota",
+                            "Failed to begin transaction for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                        return;
+                    }
+
+                    if (!BulkTransferPrimanota(conn, *state.staging_conn, bind_data.secret_name,
+                                                error_msg, mi.year_month)) {
+                        string rb_err;
+                        ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
+                        CleanupAndError(state, bind_data, output, "tblPrimanota",
+                            "Failed to transfer primanota for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                        return;
+                    }
+
+                    if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", error_msg)) {
+                        CleanupAndError(state, bind_data, output, "tblPrimanota",
+                            "Failed to commit month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                        return;
+                    }
+
+                    auto month_end = std::chrono::high_resolution_clock::now();
+                    double month_dur = std::chrono::duration<double>(month_end - month_start).count();
+                    int64_t month_rows = static_cast<int64_t>(mi.row_indices.size());
+                    total_transferred += month_rows;
+                    AddSuccessResult(bind_data, "tblPrimanota", month_rows, mi.vorlauf_id, month_dur);
+
+                    double frac = static_cast<double>(mi_idx + 1) / static_cast<double>(state.months.size());
+                    state.progress = 80.0 + frac * 15.0;
                 }
 
-                if (!BulkTransferPrimanota(conn, *state.staging_conn, bind_data.secret_name,
-                                            error_msg, mi.year_month)) {
-                    string rb_err;
-                    ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
-                    CleanupAndError(state, bind_data, output, "tblPrimanota",
-                        "Failed to transfer primanota for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                    return;
-                }
-
-                if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", error_msg)) {
-                    CleanupAndError(state, bind_data, output, "tblPrimanota",
-                        "Failed to commit month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                    return;
-                }
-
-                auto month_end = std::chrono::high_resolution_clock::now();
-                double month_dur = std::chrono::duration<double>(month_end - month_start).count();
-                int64_t month_rows = static_cast<int64_t>(mi.row_indices.size());
-                total_transferred += month_rows;
-                AddSuccessResult(bind_data, "tblPrimanota", month_rows, mi.vorlauf_id, month_dur);
-
-                // Update progress proportionally (80→95% across months)
-                double frac = static_cast<double>(mi_idx + 1) / static_cast<double>(state.months.size());
-                state.progress = 80.0 + frac * 15.0;
+                auto transfer_end = std::chrono::high_resolution_clock::now();
+                double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+                AddSuccessResult(bind_data, "tblPrimanota (total)", total_transferred, "", transfer_dur);
             }
 
             DropStagingTable(*state.staging_conn);
             state.staging_conn.reset();
-
-            auto transfer_end = std::chrono::high_resolution_clock::now();
-            double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
-            AddSuccessResult(bind_data, "tblPrimanota (total)", total_transferred, "", transfer_dur);
 
         } else {
-            // Single-vorlauf: bulk transfer within open transaction
+            // Single-vorlauf: try bcp first, fall back to INSERT VALUES within open transaction
             auto transfer_start = std::chrono::high_resolution_clock::now();
 
-            if (!BulkTransferPrimanota(*state.txn_conn, *state.staging_conn, bind_data.secret_name, error_msg)) {
-                CleanupAndError(state, bind_data, output, "tblPrimanota", error_msg, state.vorlauf_id);
-                return;
+            // Try bcp (commits its own transaction via bulk copy protocol)
+            string bcp_err;
+            int64_t bcp_rows = 0;
+            bool used_bcp = false;
+
+            // For single-vorlauf, commit the open transaction first so bcp can insert
+            if (ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+                if (BcpTransferPrimanota(*state.staging_conn, context, bind_data.secret_name,
+                                          bcp_err, bcp_rows)) {
+                    used_bcp = true;
+                }
             }
 
-            // Commit
-            if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+            if (used_bcp) {
+                DropStagingTable(*state.staging_conn);
+                state.staging_conn.reset();
                 state.txn_conn.reset();
-                CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit: " + error_msg, state.vorlauf_id);
-                return;
+
+                auto transfer_end = std::chrono::high_resolution_clock::now();
+                double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+                AddSuccessResult(bind_data, "tblPrimanota (bcp)", bcp_rows, state.vorlauf_id, transfer_dur);
+            } else {
+                // Fallback: re-open transaction and use INSERT VALUES
+                if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
+                    CleanupAndError(state, bind_data, output, "ERROR", "Failed to re-begin transaction: " + error_msg, state.vorlauf_id);
+                    return;
+                }
+
+                if (!BulkTransferPrimanota(*state.txn_conn, *state.staging_conn, bind_data.secret_name, error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblPrimanota", error_msg, state.vorlauf_id);
+                    return;
+                }
+
+                if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+                    state.txn_conn.reset();
+                    CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit: " + error_msg, state.vorlauf_id);
+                    return;
+                }
+
+                DropStagingTable(*state.staging_conn);
+                state.staging_conn.reset();
+                state.txn_conn.reset();
+
+                auto transfer_end = std::chrono::high_resolution_clock::now();
+                double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+                AddSuccessResult(bind_data, "tblPrimanota (bulk)", static_cast<int64_t>(bind_data.source_rows.size()), state.vorlauf_id, transfer_dur);
             }
-
-            DropStagingTable(*state.staging_conn);
-            state.staging_conn.reset();
-            state.txn_conn.reset();
-
-            auto transfer_end = std::chrono::high_resolution_clock::now();
-            double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
-            AddSuccessResult(bind_data, "tblPrimanota (bulk)", static_cast<int64_t>(bind_data.source_rows.size()), state.vorlauf_id, transfer_dur);
         }
 
         state.phase = ExecutionPhase::FINALIZE;

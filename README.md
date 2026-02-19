@@ -16,8 +16,9 @@ This extension provides the `into_wz` function that:
 ## Prerequisites
 
 1. **DuckDB** (v1.0+)
-2. **MSSQL Extension** - Install from [hugr-lab/mssql-extension](https://github.com/hugr-lab/mssql-extension)
+2. **MSSQL Extension** - Installed from [hugr-lab/mssql-extension](https://github.com/hugr-lab/mssql-extension) (auto-loaded by this extension)
 3. **MSSQL Server** with WZ database containing `tblVorlauf` and `tblPrimanota` tables
+4. **bcp.exe** (optional, recommended) - SQL Server BCP utility for fast bulk transfer. Falls back to batched INSERT VALUES if unavailable.
 
 ## Installation
 
@@ -49,8 +50,7 @@ The extension will be in `build/release/extension/wz/wz.duckdb_extension`.
 ## Quick Start
 
 ```sql
--- 1. Load required extensions
-LOAD mssql;
+-- 1. Load the extension (automatically loads MSSQL extension)
 LOAD wz;
 
 -- 2. Create MSSQL connection secret
@@ -63,10 +63,7 @@ CREATE SECRET mssql_secret (
     password 'your_password'
 );
 
--- 3. Attach MSSQL database using the secret
-ATTACH '' AS mssql_conn (TYPE mssql, SECRET mssql_secret);
-
--- 4. Create your source data table
+-- 3. Create your source data table
 CREATE TABLE my_bookings AS
 SELECT
     'ddebd948-4084-5c56-b339-f9b50474b586' AS guiPrimanotaID,
@@ -90,10 +87,9 @@ SELECT
     '0',
     'Sauna Poo org Gegenkonto:137005';
 
--- 5. Import data into WZ
--- The 'secret' parameter is the attached database name (mssql_conn)
+-- 4. Import data into WZ
 SELECT * FROM into_wz(
-    secret := 'mssql_conn',
+    secret := 'mssql_secret',
     source_table := 'my_bookings',
     gui_verfahren_id := '6cd5c439-110a-4e65-b7b6-0be000b58588',
     lng_kanzlei_konten_rahmen_id := 56,
@@ -300,7 +296,7 @@ SELECT * FROM into_wz(
 ```
 BEGIN TRANSACTION
   → INSERT or UPDATE tblVorlauf (1 row)
-  → INSERT tblPrimanota (N rows in batches of 1,000, 10 batches per round-trip)
+  → INSERT tblPrimanota (via BCP bulk copy, or batched INSERT VALUES as fallback)
 COMMIT
 ```
 
@@ -354,12 +350,10 @@ dtmAngelegt              →  (current timestamp)
 
 The extension is optimized for large datasets (100k+ rows):
 
-- **Batch size**: 1,000 rows per INSERT statement (MSSQL VALUES limit)
-- **Multi-statement batching**: 10 INSERT statements per network round-trip
+- **BCP bulk transfer** (primary): Uses `bcp.exe` for native bulk copy into SQL Server — fastest possible path with a generated format file for correct type handling
+- **Batched INSERT VALUES** (fallback): 1,000 rows per INSERT statement, 10 statements per network round-trip — used automatically if BCP is unavailable
 - **Pre-computed UUIDs**: All primanota IDs are generated before the insert loop
 - **Minimal overhead**: Column indices cached, constants pre-escaped, zero-copy row access
-
-For 500,000 rows this means ~50 network round-trips instead of ~5,000.
 
 ### Maximum Speed for Trusted Data
 
