@@ -23,6 +23,7 @@ namespace duckdb {
 
 static constexpr size_t PRIMANOTA_BATCH_SIZE = 1000;
 static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 1000;
+static constexpr size_t STATEMENTS_PER_QUERY = 10;  // INSERT statements per conn.Query() call
 static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
 
 // Column alias mappings are defined in wz_utils.hpp (FindColumnWithAliases)
@@ -110,6 +111,7 @@ struct IntoWzBindData : public TableFunctionData {
     bool generate_vorlauf_id;
     bool monatsvorlauf;
     bool skip_duplicate_check;
+    bool skip_fk_check;
 
     // Source data column info
     vector<string> source_columns;
@@ -300,6 +302,42 @@ static string FormatSqlValue(const Value &val) {
 }
 
 // ============================================================================
+// Helper: Format a known-numeric Value for SQL (skips type dispatch and validation)
+// Only use for columns guaranteed to be numeric (decKontoNr, curBetrag, etc.)
+// ============================================================================
+
+static inline string FormatNumericValue(const Value &val) {
+    if (val.IsNull()) {
+        return "NULL";
+    }
+    return val.ToString();
+}
+
+// ============================================================================
+// Helper: Pre-compute all primanota IDs for a set of rows.
+// If guiPrimanotaID column exists and is non-null, use it; otherwise generate UUID v5.
+// ============================================================================
+
+static vector<string> PreComputePrimanotaIds(const vector<vector<Value>> &rows,
+                                              size_t count,
+                                              const idx_t *row_indices,
+                                              idx_t primanota_id_col) {
+    vector<string> ids;
+    ids.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+        size_t row_idx = row_indices ? row_indices[i] : i;
+        const auto &row = rows[row_idx];
+        if (primanota_id_col != DConstants::INVALID_INDEX && primanota_id_col < row.size()
+            && !row[primanota_id_col].IsNull()) {
+            ids.push_back(row[primanota_id_col].ToString());
+        } else {
+            ids.push_back(GenerateRowUUID(row));
+        }
+    }
+    return ids;
+}
+
+// ============================================================================
 // Helper: Find date range in source data
 // ============================================================================
 
@@ -465,23 +503,18 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
                                        size_t batch_end,
                                        const idx_t *row_indices,
                                        const PrimanotaColumnIndices &col_idx,
-                                       const string &vorlauf_id,
-                                       const string &verfahren_id,
-                                       const string &str_angelegt,
-                                       const string &vorlauf_datum_bis,
-                                       const string &timestamp) {
+                                       const vector<string> &primanota_ids,
+                                       const string &esc_vorlauf_id,
+                                       const string &esc_verfahren_id,
+                                       const string &esc_str_angelegt,
+                                       const string &esc_vorlauf_datum_bis,
+                                       const string &timestamp,
+                                       const string &date_fallback) {
     if (batch_start >= batch_end) {
         return "";
     }
 
     size_t num_rows = batch_end - batch_start;
-
-    // Pre-escape constant strings once (not per-row)
-    string esc_str_angelegt = EscapeSqlString(str_angelegt);
-    string esc_vorlauf_id = EscapeSqlString(vorlauf_id);
-    string esc_verfahren_id = EscapeSqlString(verfahren_id);
-    string esc_vorlauf_datum_bis = EscapeSqlString(vorlauf_datum_bis) + " 00:00:00";
-    string date_fallback = timestamp.substr(0, 10);
 
     // Static null sentinel for const-ref getValue
     static const Value null_value;
@@ -522,8 +555,9 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
             return row[idx];
         };
 
-        const Value &primanota_id_val = getValue(col_idx.col_primanota_id);
-        string primanota_id = primanota_id_val.IsNull() ? GenerateRowUUID(row) : primanota_id_val.ToString();
+        // Use pre-computed primanota ID (already escaped as UUID)
+        const string &primanota_id = primanota_ids[i];
+
         const Value &beleg_datum_val = getValue(col_idx.col_beleg_datum);
         string beleg_datum = beleg_datum_val.IsNull() ? date_fallback : beleg_datum_val.ToString();
         if (beleg_datum.length() > 10) {
@@ -552,20 +586,20 @@ static string BuildPrimanotaInsertSQL(const string &db_name,
         sql += "'"; sql += timestamp; sql += "', ";  // dtmAngelegt
         sql += "NULL, ";  // strGeaendert
         sql += "NULL, ";  // dtmGeaendert
-        sql += "'"; sql += EscapeSqlString(primanota_id); sql += "', ";  // guiPrimanotaID
+        sql += "'"; sql += primanota_id; sql += "', ";  // guiPrimanotaID (UUID, safe)
         sql += "'"; sql += esc_vorlauf_id; sql += "', ";  // guiVorlaufID
         sql += "1, ";  // lngStatus
         sql += "NULL, ";  // lngZeilenNr
         sql += "1, ";  // lngEingabeWaehrungID (EUR)
         sql += "NULL, ";  // lngBu
-        sql += FormatSqlValue(gegenkonto_val); sql += ", ";  // decGegenkontoNr
-        sql += FormatSqlValue(konto_val); sql += ", ";  // decKontoNr
-        sql += FormatSqlValue(ea_konto_val); sql += ", ";  // decEaKontoNr
+        sql += FormatNumericValue(gegenkonto_val); sql += ", ";  // decGegenkontoNr
+        sql += FormatNumericValue(konto_val); sql += ", ";  // decKontoNr
+        sql += FormatNumericValue(ea_konto_val); sql += ", ";  // decEaKontoNr
         sql += "'"; sql += esc_vorlauf_datum_bis; sql += "', ";  // dtmVorlaufDatumBis
-        sql += "'"; sql += EscapeSqlString(beleg_datum); sql += "', ";  // dtmBelegDatum
+        sql += "'"; sql += beleg_datum; sql += "', ";  // dtmBelegDatum (date string, safe)
         sql += is_soll ? "1, " : "0, ";  // ysnSoll
-        sql += FormatSqlValue(eingabe_betrag_val); sql += ", ";  // curEingabeBetrag
-        sql += FormatSqlValue(basis_betrag_val); sql += ", ";  // curBasisBetrag
+        sql += FormatNumericValue(eingabe_betrag_val); sql += ", ";  // curEingabeBetrag
+        sql += FormatNumericValue(basis_betrag_val); sql += ", ";  // curBasisBetrag
         sql += "NULL, ";  // curSkontoBetrag
         sql += "NULL, ";  // curSkontoBasisBetrag
         sql += "NULL, ";  // decKostMenge
@@ -619,6 +653,7 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
     bind_data->generate_vorlauf_id = true;
     bind_data->monatsvorlauf = false;
     bind_data->skip_duplicate_check = false;
+    bind_data->skip_fk_check = false;
     bind_data->lng_kanzlei_konten_rahmen_id = 0;
 
     // Parse named parameters
@@ -639,6 +674,8 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
             bind_data->monatsvorlauf = kv.second.GetValue<bool>();
         } else if (kv.first == "skip_duplicate_check") {
             bind_data->skip_duplicate_check = kv.second.GetValue<bool>();
+        } else if (kv.first == "skip_fk_check") {
+            bind_data->skip_fk_check = kv.second.GetValue<bool>();
         }
     }
 
@@ -937,12 +974,34 @@ static bool InsertPrimanota(Connection &txn_conn,
                             string &error_message) {
     total_rows = 0;
 
-    // Pre-compute column indices and timestamp once for all batches
+    // Pre-compute everything once for all batches
     auto col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
     string timestamp = GetCurrentTimestamp();
+    string esc_vorlauf_id = EscapeSqlString(vorlauf_id);
+    string esc_verfahren_id = EscapeSqlString(bind_data.gui_verfahren_id);
+    string esc_str_angelegt = EscapeSqlString(bind_data.str_angelegt);
+    string esc_vorlauf_datum_bis = EscapeSqlString(date_to) + " 00:00:00";
+    string date_fallback = timestamp.substr(0, 10);
+
+    // Pre-compute all primanota IDs
+    auto primanota_ids = PreComputePrimanotaIds(
+        bind_data.source_rows, bind_data.source_rows.size(),
+        nullptr, col_idx.col_primanota_id);
+
+    // Multi-statement batching: accumulate multiple INSERTs per conn.Query() call
+    string combined_sql;
+    size_t stmt_count = 0;
+    size_t combined_start = 0;  // first batch_start in this combined query
 
     for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
         size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, bind_data.source_rows.size());
+
+        if (stmt_count == 0) {
+            combined_start = batch_start;
+            combined_sql.clear();
+            // Reserve for STATEMENTS_PER_QUERY batches
+            combined_sql.reserve(STATEMENTS_PER_QUERY * (500 + PRIMANOTA_BATCH_SIZE * 700));
+        }
 
         string primanota_sql = BuildPrimanotaInsertSQL(
             bind_data.secret_name,
@@ -951,21 +1010,32 @@ static bool InsertPrimanota(Connection &txn_conn,
             batch_end,
             nullptr,  // sequential access
             col_idx,
-            vorlauf_id,
-            bind_data.gui_verfahren_id,
-            bind_data.str_angelegt,
-            date_to,
-            timestamp
+            primanota_ids,
+            esc_vorlauf_id,
+            esc_verfahren_id,
+            esc_str_angelegt,
+            esc_vorlauf_datum_bis,
+            timestamp,
+            date_fallback
         );
 
-        if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
-            error_message = "Failed to insert into tblPrimanota (rows " +
-                std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
-                "): " + error_message;
-            return false;
+        if (!combined_sql.empty()) {
+            combined_sql += ";\n";
         }
+        combined_sql += primanota_sql;
+        stmt_count++;
 
-        total_rows += (batch_end - batch_start);
+        bool is_last = (batch_end >= bind_data.source_rows.size());
+        if (stmt_count >= STATEMENTS_PER_QUERY || is_last) {
+            if (!ExecuteMssqlStatementWithConn(txn_conn, combined_sql, error_message)) {
+                error_message = "Failed to insert into tblPrimanota (rows " +
+                    std::to_string(combined_start) + "-" + std::to_string(batch_end - 1) +
+                    "): " + error_message;
+                return false;
+            }
+            total_rows += (batch_end - combined_start);
+            stmt_count = 0;
+        }
     }
 
     return true;
@@ -986,13 +1056,33 @@ static bool InsertPrimanotaSubset(Connection &txn_conn,
                                    string &error_message) {
     total_rows = 0;
 
-    // Pre-compute column indices and timestamp once for all batches
+    // Pre-compute everything once for all batches
     auto col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
     string timestamp = GetCurrentTimestamp();
+    string esc_vorlauf_id = EscapeSqlString(vorlauf_id);
+    string esc_verfahren_id = EscapeSqlString(bind_data.gui_verfahren_id);
+    string esc_str_angelegt = EscapeSqlString(bind_data.str_angelegt);
+    string esc_vorlauf_datum_bis = EscapeSqlString(date_to) + " 00:00:00";
+    string date_fallback = timestamp.substr(0, 10);
 
-    // Use index-based access — no row copying needed
+    // Pre-compute primanota IDs for subset
+    auto primanota_ids = PreComputePrimanotaIds(
+        bind_data.source_rows, row_indices.size(),
+        row_indices.data(), col_idx.col_primanota_id);
+
+    // Multi-statement batching
+    string combined_sql;
+    size_t stmt_count = 0;
+    size_t combined_start = 0;
+
     for (size_t batch_start = 0; batch_start < row_indices.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
         size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, row_indices.size());
+
+        if (stmt_count == 0) {
+            combined_start = batch_start;
+            combined_sql.clear();
+            combined_sql.reserve(STATEMENTS_PER_QUERY * (500 + PRIMANOTA_BATCH_SIZE * 700));
+        }
 
         string primanota_sql = BuildPrimanotaInsertSQL(
             bind_data.secret_name,
@@ -1001,21 +1091,32 @@ static bool InsertPrimanotaSubset(Connection &txn_conn,
             batch_end,
             row_indices.data(),  // index-based access
             col_idx,
-            vorlauf_id,
-            bind_data.gui_verfahren_id,
-            bind_data.str_angelegt,
-            date_to,
-            timestamp
+            primanota_ids,
+            esc_vorlauf_id,
+            esc_verfahren_id,
+            esc_str_angelegt,
+            esc_vorlauf_datum_bis,
+            timestamp,
+            date_fallback
         );
 
-        if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
-            error_message = "Failed to insert into tblPrimanota (rows " +
-                std::to_string(batch_start) + "-" + std::to_string(batch_end - 1) +
-                "): " + error_message;
-            return false;
+        if (!combined_sql.empty()) {
+            combined_sql += ";\n";
         }
+        combined_sql += primanota_sql;
+        stmt_count++;
 
-        total_rows += (batch_end - batch_start);
+        bool is_last = (batch_end >= row_indices.size());
+        if (stmt_count >= STATEMENTS_PER_QUERY || is_last) {
+            if (!ExecuteMssqlStatementWithConn(txn_conn, combined_sql, error_message)) {
+                error_message = "Failed to insert into tblPrimanota (rows " +
+                    std::to_string(combined_start) + "-" + std::to_string(batch_end - 1) +
+                    "): " + error_message;
+                return false;
+            }
+            total_rows += (batch_end - combined_start);
+            stmt_count = 0;
+        }
     }
 
     return true;
@@ -1173,14 +1274,16 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     }
 
     // =========================================================================
-    // Step 3.5: Validate foreign key constraints against MSSQL reference tables
+    // Step 3.5: Validate foreign key constraints (skippable for trusted data)
     // =========================================================================
 
-    if (!ValidateForeignKeys(context, bind_data.secret_name,
-                             bind_data.source_rows, bind_data.source_columns, error_msg)) {
-        AddErrorResult(bind_data, "ERROR", error_msg);
-        OutputResults(bind_data, global_state, output);
-        return;
+    if (!bind_data.skip_fk_check) {
+        if (!ValidateForeignKeys(context, bind_data.secret_name,
+                                 bind_data.source_rows, bind_data.source_columns, error_msg)) {
+            AddErrorResult(bind_data, "ERROR", error_msg);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
     }
     // Propagate FK validation warning (e.g., could not query constraints) as informational row
     if (!error_msg.empty()) {
@@ -1434,6 +1537,7 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     into_wz_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["monatsvorlauf"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["skip_duplicate_check"] = LogicalType::BOOLEAN;
+    into_wz_func.named_parameters["skip_fk_check"] = LogicalType::BOOLEAN;
 
     // Register using connection and catalog
     Connection con(db);
