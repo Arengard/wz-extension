@@ -1158,24 +1158,21 @@ static bool ExportStagingToCsv(Connection &staging_conn, const string &csv_path,
     return true;
 }
 
-// Generate a BCP format file for tblPrimanota character-mode import.
+// Generate a BCP format file for character-mode import.
+// Derives column names from PRIMANOTA_COLUMN_LIST (single source of truth).
 // Uses \n (LF) as the row terminator to match DuckDB COPY TO output.
 // Without this, BCP defaults to \r\n which misparses the last column.
 static bool GenerateBcpFormatFile(const string &fmt_path, string &error_message) {
-    static const char *COL_NAMES[] = {
-        "lngTimestamp", "strAngelegt", "dtmAngelegt", "strGeaendert", "dtmGeaendert",
-        "guiPrimanotaID", "guiVorlaufID", "lngStatus", "lngZeilenNr", "lngEingabeWaehrungID",
-        "lngBu", "decGegenkontoNr", "decKontoNr", "decEaKontoNr", "dtmVorlaufDatumBis",
-        "dtmBelegDatum", "ysnSoll", "curEingabeBetrag", "curBasisBetrag", "curSkontoBetrag",
-        "curSkontoBasisBetrag", "decKostMenge", "decWaehrungskurs", "strBeleg1", "strBeleg2",
-        "strBuchText", "strKost1", "strKost2", "strEuLand", "strUstId",
-        "decEuSteuersatz", "dtmZusatzDatum", "guiVerfahrenID", "decEaSteuersatz",
-        "ysnEaTransaktionenManuell", "decEaNummer", "lngSachverhalt13b", "dtmLeistung",
-        "ysnIstversteuerungInSollversteuerung", "lngSkontoSachverhaltWarenRHB",
-        "ysnVStBeiZahlung", "guiParentPrimanota", "ysnGeneralUmkehr", "decSteuersatzManuell",
-        "ysnMitUrsprungsland", "strUrsprungsland", "strUrsprungslandUstId", "decUrsprungslandSteuersatz"
-    };
-    static constexpr int NUM_COLS = 48;
+    // Parse column names from PRIMANOTA_COLUMN_LIST
+    vector<string> col_names;
+    std::istringstream cols(PRIMANOTA_COLUMN_LIST);
+    string col;
+    while (std::getline(cols, col, ',')) {
+        // Trim whitespace
+        while (!col.empty() && col.front() == ' ') col.erase(col.begin());
+        while (!col.empty() && col.back() == ' ') col.pop_back();
+        if (!col.empty()) col_names.push_back(col);
+    }
 
     std::ofstream f(fmt_path);
     if (!f.is_open()) {
@@ -1183,28 +1180,29 @@ static bool GenerateBcpFormatFile(const string &fmt_path, string &error_message)
         return false;
     }
 
+    int num_cols = static_cast<int>(col_names.size());
     f << "14.0\n";
-    f << NUM_COLS << "\n";
-    for (int i = 0; i < NUM_COLS; i++) {
-        const char *terminator = (i < NUM_COLS - 1) ? "\\t" : "\\n";
+    f << num_cols << "\n";
+    for (int i = 0; i < num_cols; i++) {
+        const char *terminator = (i < num_cols - 1) ? "\\t" : "\\n";
         f << (i + 1) << "       SQLCHAR       0       8000      \""
-          << terminator << "\"     " << (i + 1) << "     " << COL_NAMES[i] << "       \"\"\n";
+          << terminator << "\"     " << (i + 1) << "     " << col_names[i] << "       \"\"\n";
     }
 
     f.close();
     return true;
 }
 
-// Invoke bcp.exe to bulk-load a data file into tblPrimanota using a format file.
+// Invoke bcp.exe to bulk-load a data file into a table using a format file.
 // Returns true on success, sets error_message on failure.
-static bool InvokeBcp(const MssqlConnInfo &info, const string &csv_path,
-                       const string &fmt_path,
+static bool InvokeBcp(const MssqlConnInfo &info, const string &table_name,
+                       const string &csv_path, const string &fmt_path,
                        string &error_message, int64_t &rows_loaded) {
     rows_loaded = 0;
 
     // Build bcp command using format file for correct \n row terminator
-    // bcp <db>.dbo.tblPrimanota in <file> -S <server> -f <fmt> -k -b 5000
-    string cmd = "bcp " + info.database + ".dbo.tblPrimanota in \"" + csv_path + "\"" +
+    // bcp <db>.dbo.<table> in <file> -S <server> -f <fmt> -k -b 5000
+    string cmd = "bcp " + info.database + ".dbo." + table_name + " in \"" + csv_path + "\"" +
                  " -S " + info.server +
                  " -f \"" + fmt_path + "\" -k -b 5000";
 
@@ -1295,7 +1293,7 @@ static bool BcpTransferPrimanota(Connection &staging_conn, ClientContext &contex
     }
 
     // 4. Invoke bcp with format file
-    bool success = InvokeBcp(conn_info, csv_path, fmt_path, error_message, rows_transferred);
+    bool success = InvokeBcp(conn_info, "tblPrimanota", csv_path, fmt_path, error_message, rows_transferred);
 
     // 5. Cleanup temp files
     std::filesystem::remove(csv_path);
