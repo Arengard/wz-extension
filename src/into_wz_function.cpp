@@ -226,14 +226,10 @@ struct IntoWzGlobalState : public GlobalTableFunctionState {
     // Monatsvorlauf state
     vector<MonthInfo> months;
     string cached_az_prefix;
-    size_t month_transfer_idx;    // tracks which month is being transferred next
-    int64_t total_transferred;    // running total across sequential months
-    std::chrono::high_resolution_clock::time_point transfer_start;
 
     IntoWzGlobalState() : current_idx(0), phase(ExecutionPhase::VALIDATE_PARAMS),
                            progress(0.0), vorlauf_id_from_source(false),
-                           skip_vorlauf_insert(false), month_transfer_idx(0),
-                           total_transferred(0) {}
+                           skip_vorlauf_insert(false) {}
 };
 
 // Progress callback: DuckDB polls this between Execute calls.
@@ -1850,66 +1846,58 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         auto &db = DatabaseInstance::GetDatabase(context);
 
         if (bind_data.monatsvorlauf) {
-            // Record overall start time on first month
-            if (state.month_transfer_idx == 0) {
-                state.transfer_start = std::chrono::high_resolution_clock::now();
-            }
+            // All months in one Execute call to keep the MSSQL connection alive.
+            // Returning between months lets the TDS connection go idle and time out.
+            auto transfer_start = std::chrono::high_resolution_clock::now();
+            int64_t total_transferred = 0;
 
-            // Transfer one month per Execute call
-            size_t mi_idx = state.month_transfer_idx;
-            auto &mi = state.months[mi_idx];
-            auto month_start = std::chrono::high_resolution_clock::now();
-
-            // Each month gets its own Connection + transaction
             Connection conn(db);
-            if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", error_msg)) {
-                CleanupAndError(state, bind_data, output, "tblPrimanota",
-                    "Failed to begin transaction for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                return;
+            for (size_t mi_idx = 0; mi_idx < state.months.size(); mi_idx++) {
+                auto &mi = state.months[mi_idx];
+                auto month_start = std::chrono::high_resolution_clock::now();
+
+                if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblPrimanota",
+                        "Failed to begin transaction for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                    return;
+                }
+
+                string sql = string("INSERT INTO ") + bind_data.secret_name + ".dbo.tblPrimanota (" +
+                             PRIMANOTA_COLUMN_LIST + ") SELECT " + PRIMANOTA_COLUMN_LIST +
+                             " FROM " + STAGING_TABLE_NAME +
+                             " WHERE year_month = '" + EscapeSqlString(mi.year_month) + "'";
+
+                if (!ExecuteMssqlStatementWithConn(conn, sql, error_msg)) {
+                    string rb_err;
+                    ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
+                    CleanupAndError(state, bind_data, output, "tblPrimanota",
+                        "Failed to transfer primanota for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                    return;
+                }
+
+                if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblPrimanota",
+                        "Failed to commit month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
+                    return;
+                }
+
+                auto month_end = std::chrono::high_resolution_clock::now();
+                double month_dur = std::chrono::duration<double>(month_end - month_start).count();
+                int64_t month_rows = static_cast<int64_t>(mi.row_indices.size());
+                total_transferred += month_rows;
+                AddSuccessResult(bind_data, "tblPrimanota", month_rows, mi.vorlauf_id, month_dur);
+
+                // Update progress proportionally (80→95% across months)
+                double frac = static_cast<double>(mi_idx + 1) / static_cast<double>(state.months.size());
+                state.progress = 80.0 + frac * 15.0;
             }
 
-            string sql = string("INSERT INTO ") + bind_data.secret_name + ".dbo.tblPrimanota (" +
-                         PRIMANOTA_COLUMN_LIST + ") SELECT " + PRIMANOTA_COLUMN_LIST +
-                         " FROM " + STAGING_TABLE_NAME +
-                         " WHERE year_month = '" + EscapeSqlString(mi.year_month) + "'";
-
-            if (!ExecuteMssqlStatementWithConn(conn, sql, error_msg)) {
-                string rb_err;
-                ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
-                CleanupAndError(state, bind_data, output, "tblPrimanota",
-                    "Failed to transfer primanota for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                return;
-            }
-
-            if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", error_msg)) {
-                CleanupAndError(state, bind_data, output, "tblPrimanota",
-                    "Failed to commit month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
-                return;
-            }
-
-            auto month_end = std::chrono::high_resolution_clock::now();
-            double month_dur = std::chrono::duration<double>(month_end - month_start).count();
-            int64_t month_rows = static_cast<int64_t>(mi.row_indices.size());
-            state.total_transferred += month_rows;
-            AddSuccessResult(bind_data, "tblPrimanota", month_rows, mi.vorlauf_id, month_dur);
-
-            state.month_transfer_idx++;
-
-            // More months remaining — stay in this phase, advance progress proportionally
-            if (state.month_transfer_idx < state.months.size()) {
-                double frac = static_cast<double>(state.month_transfer_idx) / static_cast<double>(state.months.size());
-                state.progress = 80.0 + frac * 15.0;  // 80→95% across months
-                OutputResults(bind_data, state, output);
-                return;
-            }
-
-            // All months done — clean up staging, emit summary
             DropStagingTable(*state.staging_conn);
             state.staging_conn.reset();
 
             auto transfer_end = std::chrono::high_resolution_clock::now();
-            double transfer_dur = std::chrono::duration<double>(transfer_end - state.transfer_start).count();
-            AddSuccessResult(bind_data, "tblPrimanota (total)", state.total_transferred, "", transfer_dur);
+            double transfer_dur = std::chrono::duration<double>(transfer_end - transfer_start).count();
+            AddSuccessResult(bind_data, "tblPrimanota (total)", total_transferred, "", transfer_dur);
 
         } else {
             // Single-vorlauf: bulk transfer within open transaction
