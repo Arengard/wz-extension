@@ -21,12 +21,43 @@ namespace duckdb {
 // Constants
 // ============================================================================
 
-static constexpr size_t PRIMANOTA_BATCH_SIZE = 100;
-static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 100;
+static constexpr size_t PRIMANOTA_BATCH_SIZE = 1000;
+static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 1000;
 static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
 
 // Column alias mappings are defined in wz_utils.hpp (FindColumnWithAliases)
 // as a single source of truth shared with constraint_checker.cpp.
+
+// Pre-computed column indices to avoid redundant lookups per batch
+struct PrimanotaColumnIndices {
+    idx_t col_primanota_id;
+    idx_t col_beleg_datum;
+    idx_t col_konto_nr;
+    idx_t col_gegenkonto_nr;
+    idx_t col_ea_konto_nr;
+    idx_t col_ysn_soll;
+    idx_t col_eingabe_betrag;
+    idx_t col_basis_betrag;
+    idx_t col_beleg1;
+    idx_t col_beleg2;
+    idx_t col_buch_text;
+
+    static PrimanotaColumnIndices Build(const vector<string> &columns) {
+        PrimanotaColumnIndices idx;
+        idx.col_primanota_id = FindColumnIndex(columns, "guiPrimanotaID");
+        idx.col_beleg_datum = FindColumnWithAliases(columns, "dtmBelegDatum");
+        idx.col_konto_nr = FindColumnWithAliases(columns, "decKontoNr");
+        idx.col_gegenkonto_nr = FindColumnWithAliases(columns, "decGegenkontoNr");
+        idx.col_ea_konto_nr = FindColumnWithAliases(columns, "decEaKontoNr");
+        idx.col_ysn_soll = FindColumnWithAliases(columns, "ysnSoll");
+        idx.col_eingabe_betrag = FindColumnWithAliases(columns, "curEingabeBetrag");
+        idx.col_basis_betrag = FindColumnWithAliases(columns, "curBasisBetrag");
+        idx.col_beleg1 = FindColumnWithAliases(columns, "strBeleg1");
+        idx.col_beleg2 = FindColumnWithAliases(columns, "strBeleg2");
+        idx.col_buch_text = FindColumnWithAliases(columns, "strBuchText");
+        return idx;
+    }
+};
 
 // ============================================================================
 // Helper: Parse Soll/Haben string to boolean
@@ -78,6 +109,7 @@ struct IntoWzBindData : public TableFunctionData {
     string str_angelegt;
     bool generate_vorlauf_id;
     bool monatsvorlauf;
+    bool skip_duplicate_check;
 
     // Source data column info
     vector<string> source_columns;
@@ -421,132 +453,140 @@ static string BuildVorlaufInsertSQL(const string &db_name,
 }
 
 // ============================================================================
-// Helper: Build Primanota INSERT SQL for a batch of rows (using iterators to avoid copying)
+// Helper: Build Primanota INSERT SQL for a batch of rows.
+// Uses index-based row access: when row_indices is non-null, accesses
+// rows[row_indices[i]] for i in [batch_start, batch_end); otherwise
+// accesses rows[i] directly.
 // ============================================================================
 
 static string BuildPrimanotaInsertSQL(const string &db_name,
-                                       vector<vector<Value>>::const_iterator rows_begin,
-                                       vector<vector<Value>>::const_iterator rows_end,
-                                       const vector<string> &columns,
+                                       const vector<vector<Value>> &rows,
+                                       size_t batch_start,
+                                       size_t batch_end,
+                                       const idx_t *row_indices,
+                                       const PrimanotaColumnIndices &col_idx,
                                        const string &vorlauf_id,
                                        const string &verfahren_id,
                                        const string &str_angelegt,
-                                       const string &vorlauf_datum_bis) {
-    if (rows_begin == rows_end) {
+                                       const string &vorlauf_datum_bis,
+                                       const string &timestamp) {
+    if (batch_start >= batch_end) {
         return "";
     }
 
-    string timestamp = GetCurrentTimestamp();
+    size_t num_rows = batch_end - batch_start;
 
-    // Find column indices using shared alias definitions (single source of truth in wz_utils.hpp)
-    idx_t col_primanota_id = FindColumnIndex(columns, "guiPrimanotaID");
-    idx_t col_beleg_datum = FindColumnWithAliases(columns, "dtmBelegDatum");
-    idx_t col_konto_nr = FindColumnWithAliases(columns, "decKontoNr");
-    idx_t col_gegenkonto_nr = FindColumnWithAliases(columns, "decGegenkontoNr");
-    idx_t col_ea_konto_nr = FindColumnWithAliases(columns, "decEaKontoNr");
-    idx_t col_ysn_soll = FindColumnWithAliases(columns, "ysnSoll");
-    idx_t col_eingabe_betrag = FindColumnWithAliases(columns, "curEingabeBetrag");
-    idx_t col_basis_betrag = FindColumnWithAliases(columns, "curBasisBetrag");
-    idx_t col_beleg1 = FindColumnWithAliases(columns, "strBeleg1");
-    idx_t col_beleg2 = FindColumnWithAliases(columns, "strBeleg2");
-    idx_t col_buch_text = FindColumnWithAliases(columns, "strBuchText");
+    // Pre-escape constant strings once (not per-row)
+    string esc_str_angelegt = EscapeSqlString(str_angelegt);
+    string esc_vorlauf_id = EscapeSqlString(vorlauf_id);
+    string esc_verfahren_id = EscapeSqlString(verfahren_id);
+    string esc_vorlauf_datum_bis = EscapeSqlString(vorlauf_datum_bis) + " 00:00:00";
+    string date_fallback = timestamp.substr(0, 10);
 
-    std::ostringstream sql;
-    sql << "INSERT INTO " << db_name << ".dbo.tblPrimanota (";
-    sql << "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
-    sql << "guiPrimanotaID, guiVorlaufID, lngStatus, lngZeilenNr, lngEingabeWaehrungID, ";
-    sql << "lngBu, decGegenkontoNr, decKontoNr, decEaKontoNr, dtmVorlaufDatumBis, ";
-    sql << "dtmBelegDatum, ysnSoll, curEingabeBetrag, curBasisBetrag, curSkontoBetrag, ";
-    sql << "curSkontoBasisBetrag, decKostMenge, decWaehrungskurs, strBeleg1, strBeleg2, ";
-    sql << "strBuchText, strKost1, strKost2, strEuLand, strUstId, ";
-    sql << "decEuSteuersatz, dtmZusatzDatum, guiVerfahrenID, decEaSteuersatz, ";
-    sql << "ysnEaTransaktionenManuell, decEaNummer, lngSachverhalt13b, dtmLeistung, ";
-    sql << "ysnIstversteuerungInSollversteuerung, lngSkontoSachverhaltWarenRHB, ";
-    sql << "ysnVStBeiZahlung, guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell, ";
-    sql << "ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz";
-    sql << ") VALUES\n";
+    // Static null sentinel for const-ref getValue
+    static const Value null_value;
 
-    bool first = true;
-    for (auto it = rows_begin; it != rows_end; ++it) {
-        const auto &row = *it;
+    // Pre-reserve string capacity (~700 bytes per row + ~500 header)
+    string sql;
+    sql.reserve(500 + num_rows * 700);
 
-        if (!first) {
-            sql << ",\n";
+    sql += "INSERT INTO ";
+    sql += db_name;
+    sql += ".dbo.tblPrimanota (";
+    sql += "lngTimestamp, strAngelegt, dtmAngelegt, strGeaendert, dtmGeaendert, ";
+    sql += "guiPrimanotaID, guiVorlaufID, lngStatus, lngZeilenNr, lngEingabeWaehrungID, ";
+    sql += "lngBu, decGegenkontoNr, decKontoNr, decEaKontoNr, dtmVorlaufDatumBis, ";
+    sql += "dtmBelegDatum, ysnSoll, curEingabeBetrag, curBasisBetrag, curSkontoBetrag, ";
+    sql += "curSkontoBasisBetrag, decKostMenge, decWaehrungskurs, strBeleg1, strBeleg2, ";
+    sql += "strBuchText, strKost1, strKost2, strEuLand, strUstId, ";
+    sql += "decEuSteuersatz, dtmZusatzDatum, guiVerfahrenID, decEaSteuersatz, ";
+    sql += "ysnEaTransaktionenManuell, decEaNummer, lngSachverhalt13b, dtmLeistung, ";
+    sql += "ysnIstversteuerungInSollversteuerung, lngSkontoSachverhaltWarenRHB, ";
+    sql += "ysnVStBeiZahlung, guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell, ";
+    sql += "ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz";
+    sql += ") VALUES\n";
+
+    for (size_t i = batch_start; i < batch_end; i++) {
+        size_t row_idx = row_indices ? row_indices[i] : i;
+        const auto &row = rows[row_idx];
+
+        if (i > batch_start) {
+            sql += ",\n";
         }
-        first = false;
 
-        // Get values from row with safe access
-        auto getValue = [&row](idx_t idx) -> Value {
+        // Get values from row with safe access (returns const ref, no copy)
+        auto getValue = [&row](idx_t idx) -> const Value& {
             if (idx == DConstants::INVALID_INDEX || idx >= row.size()) {
-                return Value();
+                return null_value;
             }
             return row[idx];
         };
 
-        string primanota_id = getValue(col_primanota_id).IsNull() ? GenerateRowUUID(row) : getValue(col_primanota_id).ToString();
-        string beleg_datum = getValue(col_beleg_datum).IsNull() ? timestamp.substr(0, 10) : getValue(col_beleg_datum).ToString();
+        const Value &primanota_id_val = getValue(col_idx.col_primanota_id);
+        string primanota_id = primanota_id_val.IsNull() ? GenerateRowUUID(row) : primanota_id_val.ToString();
+        const Value &beleg_datum_val = getValue(col_idx.col_beleg_datum);
+        string beleg_datum = beleg_datum_val.IsNull() ? date_fallback : beleg_datum_val.ToString();
         if (beleg_datum.length() > 10) {
             beleg_datum = beleg_datum.substr(0, 10);
         }
         beleg_datum += " 00:00:00";
 
-        Value konto_val = getValue(col_konto_nr);
-        Value gegenkonto_val = getValue(col_gegenkonto_nr);
-        Value ea_konto_val = getValue(col_ea_konto_nr);
-        Value ysn_soll_val = getValue(col_ysn_soll);
-        bool is_soll = ParseSollHaben(ysn_soll_val);  // Parse Soll/Haben string
-        Value eingabe_betrag_val = getValue(col_eingabe_betrag);
-        Value basis_betrag_val = getValue(col_basis_betrag);
-        Value beleg1_val = getValue(col_beleg1);
-        Value beleg2_val = getValue(col_beleg2);
-        Value buch_text_val = getValue(col_buch_text);
+        const Value &konto_val = getValue(col_idx.col_konto_nr);
+        const Value &gegenkonto_val = getValue(col_idx.col_gegenkonto_nr);
+        const Value &ea_konto_val = getValue(col_idx.col_ea_konto_nr);
+        const Value &ysn_soll_val = getValue(col_idx.col_ysn_soll);
+        bool is_soll = ParseSollHaben(ysn_soll_val);
+        const Value &eingabe_betrag_val = getValue(col_idx.col_eingabe_betrag);
+        const Value &basis_betrag_ref = getValue(col_idx.col_basis_betrag);
+        const Value &beleg1_val = getValue(col_idx.col_beleg1);
+        const Value &beleg2_val = getValue(col_idx.col_beleg2);
+        const Value &buch_text_val = getValue(col_idx.col_buch_text);
 
         // Use eingabe_betrag for basis_betrag if not provided
-        if (basis_betrag_val.IsNull() && !eingabe_betrag_val.IsNull()) {
-            basis_betrag_val = eingabe_betrag_val;
-        }
+        const Value &basis_betrag_val = (basis_betrag_ref.IsNull() && !eingabe_betrag_val.IsNull())
+            ? eingabe_betrag_val : basis_betrag_ref;
 
-        sql << "(";
-        sql << "0, ";  // lngTimestamp
-        sql << "'" << EscapeSqlString(str_angelegt) << "', ";  // strAngelegt
-        sql << "'" << timestamp << "', ";  // dtmAngelegt
-        sql << "NULL, ";  // strGeaendert
-        sql << "NULL, ";  // dtmGeaendert
-        sql << "'" << EscapeSqlString(primanota_id) << "', ";  // guiPrimanotaID
-        sql << "'" << EscapeSqlString(vorlauf_id) << "', ";  // guiVorlaufID
-        sql << "1, ";  // lngStatus
-        sql << "NULL, ";  // lngZeilenNr
-        sql << "1, ";  // lngEingabeWaehrungID (EUR)
-        sql << "NULL, ";  // lngBu
-        sql << FormatSqlValue(gegenkonto_val) << ", ";  // decGegenkontoNr
-        sql << FormatSqlValue(konto_val) << ", ";  // decKontoNr
-        sql << FormatSqlValue(ea_konto_val) << ", ";  // decEaKontoNr
-        sql << "'" << EscapeSqlString(vorlauf_datum_bis) << " 00:00:00', ";  // dtmVorlaufDatumBis
-        sql << "'" << EscapeSqlString(beleg_datum) << "', ";  // dtmBelegDatum
-        sql << (is_soll ? "1" : "0") << ", ";  // ysnSoll (parsed from sh/Soll/Haben)
-        sql << FormatSqlValue(eingabe_betrag_val) << ", ";  // curEingabeBetrag
-        sql << FormatSqlValue(basis_betrag_val) << ", ";  // curBasisBetrag
-        sql << "NULL, ";  // curSkontoBetrag
-        sql << "NULL, ";  // curSkontoBasisBetrag
-        sql << "NULL, ";  // decKostMenge
-        sql << "NULL, ";  // decWaehrungskurs
-        sql << (beleg1_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg1_val.ToString()) + "'") << ", ";  // strBeleg1
-        sql << (beleg2_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg2_val.ToString()) + "'") << ", ";  // strBeleg2
-        sql << (buch_text_val.IsNull() ? "NULL" : "'" + EscapeSqlString(buch_text_val.ToString()) + "'") << ", ";  // strBuchText
-        sql << "NULL, NULL, ";  // strKost1, strKost2
-        sql << "NULL, NULL, ";  // strEuLand, strUstId
-        sql << "NULL, NULL, ";  // decEuSteuersatz, dtmZusatzDatum
-        sql << "'" << EscapeSqlString(verfahren_id) << "', ";  // guiVerfahrenID
-        sql << "NULL, ";  // decEaSteuersatz
-        sql << "0, ";  // ysnEaTransaktionenManuell
-        sql << "NULL, NULL, NULL, ";  // decEaNummer, lngSachverhalt13b, dtmLeistung
-        sql << "0, NULL, 0, ";  // ysnIstversteuerung..., lngSkontoSachverhalt..., ysnVStBeiZahlung
-        sql << "NULL, 0, NULL, ";  // guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell
-        sql << "0, NULL, NULL, NULL";  // ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz
-        sql << ")";
+        sql += "(";
+        sql += "0, ";  // lngTimestamp
+        sql += "'"; sql += esc_str_angelegt; sql += "', ";  // strAngelegt
+        sql += "'"; sql += timestamp; sql += "', ";  // dtmAngelegt
+        sql += "NULL, ";  // strGeaendert
+        sql += "NULL, ";  // dtmGeaendert
+        sql += "'"; sql += EscapeSqlString(primanota_id); sql += "', ";  // guiPrimanotaID
+        sql += "'"; sql += esc_vorlauf_id; sql += "', ";  // guiVorlaufID
+        sql += "1, ";  // lngStatus
+        sql += "NULL, ";  // lngZeilenNr
+        sql += "1, ";  // lngEingabeWaehrungID (EUR)
+        sql += "NULL, ";  // lngBu
+        sql += FormatSqlValue(gegenkonto_val); sql += ", ";  // decGegenkontoNr
+        sql += FormatSqlValue(konto_val); sql += ", ";  // decKontoNr
+        sql += FormatSqlValue(ea_konto_val); sql += ", ";  // decEaKontoNr
+        sql += "'"; sql += esc_vorlauf_datum_bis; sql += "', ";  // dtmVorlaufDatumBis
+        sql += "'"; sql += EscapeSqlString(beleg_datum); sql += "', ";  // dtmBelegDatum
+        sql += is_soll ? "1, " : "0, ";  // ysnSoll
+        sql += FormatSqlValue(eingabe_betrag_val); sql += ", ";  // curEingabeBetrag
+        sql += FormatSqlValue(basis_betrag_val); sql += ", ";  // curBasisBetrag
+        sql += "NULL, ";  // curSkontoBetrag
+        sql += "NULL, ";  // curSkontoBasisBetrag
+        sql += "NULL, ";  // decKostMenge
+        sql += "NULL, ";  // decWaehrungskurs
+        sql += beleg1_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg1_val.ToString()) + "'"; sql += ", ";  // strBeleg1
+        sql += beleg2_val.IsNull() ? "NULL" : "'" + EscapeSqlString(beleg2_val.ToString()) + "'"; sql += ", ";  // strBeleg2
+        sql += buch_text_val.IsNull() ? "NULL" : "'" + EscapeSqlString(buch_text_val.ToString()) + "'"; sql += ", ";  // strBuchText
+        sql += "NULL, NULL, ";  // strKost1, strKost2
+        sql += "NULL, NULL, ";  // strEuLand, strUstId
+        sql += "NULL, NULL, ";  // decEuSteuersatz, dtmZusatzDatum
+        sql += "'"; sql += esc_verfahren_id; sql += "', ";  // guiVerfahrenID
+        sql += "NULL, ";  // decEaSteuersatz
+        sql += "0, ";  // ysnEaTransaktionenManuell
+        sql += "NULL, NULL, NULL, ";  // decEaNummer, lngSachverhalt13b, dtmLeistung
+        sql += "0, NULL, 0, ";  // ysnIstversteuerung..., lngSkontoSachverhalt..., ysnVStBeiZahlung
+        sql += "NULL, 0, NULL, ";  // guiParentPrimanota, ysnGeneralUmkehr, decSteuersatzManuell
+        sql += "0, NULL, NULL, NULL";  // ysnMitUrsprungsland, strUrsprungsland, strUrsprungslandUstId, decUrsprungslandSteuersatz
+        sql += ")";
     }
 
-    return sql.str();
+    return sql;
 }
 
 
@@ -578,6 +618,7 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
     // Set defaults (overridden by parsed parameters below)
     bind_data->generate_vorlauf_id = true;
     bind_data->monatsvorlauf = false;
+    bind_data->skip_duplicate_check = false;
     bind_data->lng_kanzlei_konten_rahmen_id = 0;
 
     // Parse named parameters
@@ -596,6 +637,8 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
             bind_data->generate_vorlauf_id = kv.second.GetValue<bool>();
         } else if (kv.first == "monatsvorlauf") {
             bind_data->monatsvorlauf = kv.second.GetValue<bool>();
+        } else if (kv.first == "skip_duplicate_check") {
+            bind_data->skip_duplicate_check = kv.second.GetValue<bool>();
         }
     }
 
@@ -894,21 +937,25 @@ static bool InsertPrimanota(Connection &txn_conn,
                             string &error_message) {
     total_rows = 0;
 
+    // Pre-compute column indices and timestamp once for all batches
+    auto col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
+    string timestamp = GetCurrentTimestamp();
+
     for (size_t batch_start = 0; batch_start < bind_data.source_rows.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
         size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, bind_data.source_rows.size());
 
-        auto rows_begin = bind_data.source_rows.begin() + batch_start;
-        auto rows_end = bind_data.source_rows.begin() + batch_end;
-
         string primanota_sql = BuildPrimanotaInsertSQL(
             bind_data.secret_name,
-            rows_begin,
-            rows_end,
-            bind_data.source_columns,
+            bind_data.source_rows,
+            batch_start,
+            batch_end,
+            nullptr,  // sequential access
+            col_idx,
             vorlauf_id,
             bind_data.gui_verfahren_id,
             bind_data.str_angelegt,
-            date_to
+            date_to,
+            timestamp
         );
 
         if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
@@ -918,7 +965,7 @@ static bool InsertPrimanota(Connection &txn_conn,
             return false;
         }
 
-        total_rows += std::distance(rows_begin, rows_end);
+        total_rows += (batch_end - batch_start);
     }
 
     return true;
@@ -939,28 +986,26 @@ static bool InsertPrimanotaSubset(Connection &txn_conn,
                                    string &error_message) {
     total_rows = 0;
 
-    // Build a contiguous vector of the subset rows for BuildPrimanotaInsertSQL
-    vector<vector<Value>> subset_rows;
-    subset_rows.reserve(row_indices.size());
-    for (idx_t idx : row_indices) {
-        subset_rows.push_back(bind_data.source_rows[idx]);
-    }
+    // Pre-compute column indices and timestamp once for all batches
+    auto col_idx = PrimanotaColumnIndices::Build(bind_data.source_columns);
+    string timestamp = GetCurrentTimestamp();
 
-    for (size_t batch_start = 0; batch_start < subset_rows.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
-        size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, subset_rows.size());
-
-        auto rows_begin = subset_rows.begin() + batch_start;
-        auto rows_end = subset_rows.begin() + batch_end;
+    // Use index-based access — no row copying needed
+    for (size_t batch_start = 0; batch_start < row_indices.size(); batch_start += PRIMANOTA_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + PRIMANOTA_BATCH_SIZE, row_indices.size());
 
         string primanota_sql = BuildPrimanotaInsertSQL(
             bind_data.secret_name,
-            rows_begin,
-            rows_end,
-            bind_data.source_columns,
+            bind_data.source_rows,
+            batch_start,
+            batch_end,
+            row_indices.data(),  // index-based access
+            col_idx,
             vorlauf_id,
             bind_data.gui_verfahren_id,
             bind_data.str_angelegt,
-            date_to
+            date_to,
+            timestamp
         );
 
         if (!ExecuteMssqlStatementWithConn(txn_conn, primanota_sql, error_message)) {
@@ -970,7 +1015,7 @@ static bool InsertPrimanotaSubset(Connection &txn_conn,
             return false;
         }
 
-        total_rows += std::distance(rows_begin, rows_end);
+        total_rows += (batch_end - batch_start);
     }
 
     return true;
@@ -1116,13 +1161,15 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
     }
 
     // =========================================================================
-    // Step 3: Check for duplicate Primanota IDs
+    // Step 3: Check for duplicate Primanota IDs (skippable for trusted data)
     // =========================================================================
 
-    if (!ValidateDuplicates(context, bind_data, error_msg)) {
-        AddErrorResult(bind_data, "ERROR", error_msg);
-        OutputResults(bind_data, global_state, output);
-        return;
+    if (!bind_data.skip_duplicate_check) {
+        if (!ValidateDuplicates(context, bind_data, error_msg)) {
+            AddErrorResult(bind_data, "ERROR", error_msg);
+            OutputResults(bind_data, global_state, output);
+            return;
+        }
     }
 
     // =========================================================================
@@ -1386,6 +1433,7 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     into_wz_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["monatsvorlauf"] = LogicalType::BOOLEAN;
+    into_wz_func.named_parameters["skip_duplicate_check"] = LogicalType::BOOLEAN;
 
     // Register using connection and catalog
     Connection con(db);

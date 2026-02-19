@@ -91,11 +91,12 @@ static void CheckValueExistence(Connection &conn,
                                  const ForeignKeyConstraint &fk,
                                  const std::set<string> &distinct_values,
                                  vector<string> &missing_values) {
-    // Batch in groups of 100 (same pattern as CheckDuplicates)
+    // Batch in groups of 1000 (same pattern as CheckDuplicates)
+    static constexpr size_t FK_BATCH_SIZE = 1000;
     vector<string> all_values(distinct_values.begin(), distinct_values.end());
 
-    for (size_t batch_start = 0; batch_start < all_values.size(); batch_start += 100) {
-        size_t batch_end = std::min(batch_start + 100, all_values.size());
+    for (size_t batch_start = 0; batch_start < all_values.size(); batch_start += FK_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + FK_BATCH_SIZE, all_values.size());
 
         // Build IN clause
         string in_clause;
