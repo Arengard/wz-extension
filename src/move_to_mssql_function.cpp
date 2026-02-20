@@ -260,7 +260,7 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
     string select_cols;
     for (size_t i = 0; i < columns.size(); i++) {
         if (i > 0) { mssql_col_list += ", "; select_cols += ", "; }
-        mssql_col_list += "[" + columns[i].name + "]";
+        mssql_col_list += "\"" + columns[i].name + "\"";
         select_cols += "\"" + columns[i].name + "\"";
     }
 
@@ -495,7 +495,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                         string create_cols;
                         for (size_t i = 0; i < table.columns.size(); i++) {
                             if (i > 0) create_cols += ", ";
-                            create_cols += "[" + table.columns[i].name + "] " + table.columns[i].mssql_type;
+                            create_cols += "\"" + table.columns[i].name + "\" " + table.columns[i].mssql_type;
                         }
                         string create_sql = "CREATE TABLE " + bind_data.secret_name +
                                             "." + bind_data.target_schema + ".\"" + table.name + "\" (" +
