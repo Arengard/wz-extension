@@ -273,8 +273,8 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
     }
 
     idx_t col_count = result->types.size();
-    string insert_prefix = "INSERT INTO " + db_name + ".[" + schema + "].[" +
-                           mssql_table_name + "] (" + mssql_col_list + ") VALUES ";
+    string insert_prefix = "INSERT INTO " + db_name + "." + schema + ".\"" +
+                           mssql_table_name + "\" (" + mssql_col_list + ") VALUES ";
 
     vector<string> pending_stmts;
     idx_t rows_in_batch = 0;
@@ -399,7 +399,8 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                 Connection conn(db);
                 auto result = conn.Query(
                     "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
+                    "WHERE table_catalog = 'memory' "
+                    "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
                     "AND table_type = 'BASE TABLE' ORDER BY table_name");
                 if (!result->HasError()) {
                     for (auto &chunk : result->Collection().Chunks()) {
@@ -483,7 +484,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                     {
                         Connection mssql_conn(db);
                         string drop_sql = "DROP TABLE IF EXISTS " + bind_data.secret_name +
-                                          ".[" + bind_data.target_schema + "].[" + table.name + "]";
+                                          "." + bind_data.target_schema + ".\"" + table.name + "\"";
                         ExecuteMssqlStatement(mssql_conn, drop_sql, error_msg);  // ignore error
                     }
 
@@ -497,7 +498,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                             create_cols += "[" + table.columns[i].name + "] " + table.columns[i].mssql_type;
                         }
                         string create_sql = "CREATE TABLE " + bind_data.secret_name +
-                                            ".[" + bind_data.target_schema + "].[" + table.name + "] (" +
+                                            "." + bind_data.target_schema + ".\"" + table.name + "\" (" +
                                             create_cols + ")";
                         create_ok = ExecuteMssqlStatement(mssql_conn, create_sql, error_msg);
                     }
