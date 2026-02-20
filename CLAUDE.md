@@ -85,3 +85,23 @@ After completing implementation work, always:
 2. Commit all changes with a descriptive message
 3. Push to remote (`git push`)
 4. Copy the built extension to `dist/` if the build succeeded
+
+## Updating for New DuckDB Versions
+
+DuckDB C++ API is not stable — extensions are tightly coupled to specific versions and may need updates when DuckDB releases a new version. Reference: https://github.com/duckdb/community-extensions/blob/main/UPDATING.md
+
+### Before a DuckDB Release (proactive)
+
+1. Create a branch named `vx.y-<codename>` matching the upcoming DuckDB release branch
+2. In the CI workflow on that branch, disable the `duckdb-stable-build` job (`if: false`) since it targets the unreleased version
+3. Update the DuckDB submodule to the `vx.y-codename` branch: `cd duckdb && git fetch && git checkout vx.y-codename && cd .. && git add duckdb`
+4. Fix any compilation errors from API changes
+5. Submit a PR to `duckdb/community-extensions` adding `ref_next` to the extension descriptor pointing to the updated branch's latest commit
+
+### After a DuckDB Release (reactive)
+
+1. Apply fixes directly to `main` branch
+2. Update the DuckDB submodule to the new release tag: `cd duckdb && git fetch --tags && git checkout vx.y.z && cd .. && git add duckdb`
+3. Update `extension-ci-tools` submodule similarly
+4. Fix any compilation errors, rebuild, test
+5. Submit a PR to `duckdb/community-extensions` updating the descriptor with the new commit ref
