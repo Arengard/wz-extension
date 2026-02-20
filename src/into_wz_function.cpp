@@ -1,5 +1,6 @@
 #include "wz_extension.hpp"
 #include "wz_utils.hpp"
+#include "mssql_utils.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -34,8 +35,6 @@ namespace duckdb {
 
 static constexpr size_t DUPLICATE_CHECK_BATCH_SIZE = 1000;
 static constexpr size_t MAX_DUPLICATES_TO_DISPLAY = 5;
-static constexpr size_t MSSQL_INSERT_BATCH_SIZE = 1000;   // rows per INSERT VALUES (MSSQL max)
-static constexpr size_t MSSQL_STMTS_PER_ROUNDTRIP = 5;   // INSERT statements per conn.Query()
 
 // Staging table name for bulk Primanota transfer
 static const char *STAGING_TABLE_NAME = "__wz_primanota_staging";
@@ -578,21 +577,6 @@ static inline Value ToVarchar(const Value &val) {
 
 
 // ============================================================================
-// Helper: Execute SQL statement via a Connection (for transaction continuity)
-// ============================================================================
-
-static bool ExecuteMssqlStatementWithConn(Connection &conn,
-                                           const string &sql,
-                                           string &error_message) {
-    auto result = conn.Query(sql);
-    if (result->HasError()) {
-        error_message = result->GetError();
-        return false;
-    }
-    return true;
-}
-
-// ============================================================================
 // Bind function
 // ============================================================================
 
@@ -738,7 +722,7 @@ static void CleanupAndError(IntoWzGlobalState &state, IntoWzBindData &bind_data,
                              const string &error_message, const string &vorlauf_id = "") {
     if (state.txn_conn) {
         string rb_err;
-        ExecuteMssqlStatementWithConn(*state.txn_conn, "ROLLBACK", rb_err);
+        ExecuteMssqlStatement(*state.txn_conn, "ROLLBACK", rb_err);
         state.txn_conn.reset();
     }
     if (state.staging_conn) {
@@ -887,7 +871,7 @@ static bool InsertVorlauf(Connection &txn_conn,
         bezeichnung
     );
 
-    if (!ExecuteMssqlStatementWithConn(txn_conn, vorlauf_sql, error_message)) {
+    if (!ExecuteMssqlStatement(txn_conn, vorlauf_sql, error_message)) {
         error_message = "Failed to insert into tblVorlauf: " + error_message;
         return false;
     }
@@ -917,7 +901,7 @@ static bool UpdateVorlauf(Connection &txn_conn,
     sql << "dtmGeaendert = '" << timestamp << "' ";
     sql << "WHERE guiVorlaufID = '" << EscapeSqlString(vorlauf_id) << "'";
 
-    if (!ExecuteMssqlStatementWithConn(txn_conn, sql.str(), error_message)) {
+    if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
         error_message = "Failed to update tblVorlauf: " + error_message;
         return false;
     }
@@ -1041,104 +1025,6 @@ static bool PopulateStagingTable(Connection &staging_conn,
 // BCP-based bulk transfer: export staging to CSV, invoke bcp.exe
 // ============================================================================
 
-// Parse MSSQL connection string into components.
-// Supports both ODBC-style "Server=x;Database=y;Uid=z;Pwd=w" and
-// key variations (UID/User ID, PWD/Password, etc.)
-struct MssqlConnInfo {
-    string server;
-    string database;
-    string user;
-    string password;
-    bool trusted;  // Windows authentication
-};
-
-static bool ParseConnectionString(const string &conn_str, MssqlConnInfo &info) {
-    info.trusted = false;
-    // Split by semicolons, parse key=value pairs
-    std::istringstream ss(conn_str);
-    string token;
-    while (std::getline(ss, token, ';')) {
-        auto eq_pos = token.find('=');
-        if (eq_pos == string::npos) continue;
-        string key = token.substr(0, eq_pos);
-        string val = token.substr(eq_pos + 1);
-        // Trim whitespace
-        while (!key.empty() && key.front() == ' ') key.erase(key.begin());
-        while (!key.empty() && key.back() == ' ') key.pop_back();
-        // Case-insensitive key matching
-        string lower_key;
-        lower_key.resize(key.size());
-        std::transform(key.begin(), key.end(), lower_key.begin(), ::tolower);
-
-        if (lower_key == "server" || lower_key == "data source") {
-            info.server = val;
-        } else if (lower_key == "database" || lower_key == "initial catalog") {
-            info.database = val;
-        } else if (lower_key == "uid" || lower_key == "user id" || lower_key == "user") {
-            info.user = val;
-        } else if (lower_key == "pwd" || lower_key == "password") {
-            info.password = val;
-        } else if (lower_key == "trusted_connection" || lower_key == "integrated security") {
-            string lower_val;
-            lower_val.resize(val.size());
-            std::transform(val.begin(), val.end(), lower_val.begin(), ::tolower);
-            if (lower_val == "yes" || lower_val == "true" || lower_val == "sspi") {
-                info.trusted = true;
-            }
-        }
-    }
-    return !info.server.empty() && !info.database.empty() &&
-           (info.trusted || (!info.user.empty() && !info.password.empty()));
-}
-
-// Try to extract MSSQL connection info from a DuckDB secret using the C++ SecretManager API.
-// This bypasses the duckdb_secrets(redact=false) SQL function which is blocked by default in v1.4+.
-static bool GetMssqlConnInfo(ClientContext &context, const string &secret_name, MssqlConnInfo &info) {
-    auto &db = DatabaseInstance::GetDatabase(context);
-    auto &secret_manager = SecretManager::Get(db);
-    auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-
-    // Helper: extract host/database/user/password from a KeyValueSecret
-    auto extract_info = [&](const KeyValueSecret *kv) -> bool {
-        info = MssqlConnInfo();  // reset
-        Value val;
-        if (kv->TryGetValue("host", val) && !val.IsNull()) info.server = val.ToString();
-        if (kv->TryGetValue("database", val) && !val.IsNull()) info.database = val.ToString();
-        if (kv->TryGetValue("user", val) && !val.IsNull()) info.user = val.ToString();
-        if (kv->TryGetValue("password", val) && !val.IsNull()) info.password = val.ToString();
-        // Append non-default port to server (bcp uses "server,port" syntax)
-        if (kv->TryGetValue("port", val) && !val.IsNull()) {
-            string port_str = val.ToString();
-            if (!port_str.empty() && port_str != "1433") {
-                info.server += "," + port_str;
-            }
-        }
-        return !info.server.empty() && !info.database.empty() &&
-               (info.trusted || (!info.user.empty() && !info.password.empty()));
-    };
-
-    // Try 1: Look up secret by exact name (works when user passes the actual secret name)
-    auto entry = secret_manager.GetSecretByName(transaction, secret_name);
-    if (entry) {
-        auto *kv = dynamic_cast<const KeyValueSecret *>(entry->secret.get());
-        if (kv && extract_info(kv)) return true;
-    }
-
-    // Try 2: Scan all secrets for the first MSSQL-type secret
-    // (handles the common case where secret param is the DB alias, not the secret name)
-    auto all = secret_manager.AllSecrets(transaction);
-    for (auto &e : all) {
-        string type = e.secret->GetType();
-        std::transform(type.begin(), type.end(), type.begin(), ::tolower);
-        if (type == "mssql") {
-            auto *kv = dynamic_cast<const KeyValueSecret *>(e.secret.get());
-            if (kv && extract_info(kv)) return true;
-        }
-    }
-
-    return false;
-}
-
 // Export staging table to a tab-separated file for bcp.
 static bool ExportStagingToCsv(Connection &staging_conn, const string &csv_path,
                                  string &error_message,
@@ -1158,107 +1044,18 @@ static bool ExportStagingToCsv(Connection &staging_conn, const string &csv_path,
     return true;
 }
 
-// Generate a BCP format file for character-mode import.
-// Derives column names from PRIMANOTA_COLUMN_LIST (single source of truth).
-// Uses \n (LF) as the row terminator to match DuckDB COPY TO output.
-// Without this, BCP defaults to \r\n which misparses the last column.
-static bool GenerateBcpFormatFile(const string &fmt_path, string &error_message) {
-    // Parse column names from PRIMANOTA_COLUMN_LIST
+// WZ-specific wrapper: parse column names from PRIMANOTA_COLUMN_LIST and
+// delegate to the shared GenerateBcpFormatFile in mssql_utils.hpp.
+static bool GeneratePrimanotaFormatFile(const string &fmt_path, string &error_message) {
     vector<string> col_names;
     std::istringstream cols(PRIMANOTA_COLUMN_LIST);
     string col;
     while (std::getline(cols, col, ',')) {
-        // Trim whitespace
         while (!col.empty() && col.front() == ' ') col.erase(col.begin());
         while (!col.empty() && col.back() == ' ') col.pop_back();
         if (!col.empty()) col_names.push_back(col);
     }
-
-    std::ofstream f(fmt_path);
-    if (!f.is_open()) {
-        error_message = "Failed to create BCP format file: " + fmt_path;
-        return false;
-    }
-
-    int num_cols = static_cast<int>(col_names.size());
-    f << "14.0\n";
-    f << num_cols << "\n";
-    for (int i = 0; i < num_cols; i++) {
-        const char *terminator = (i < num_cols - 1) ? "\\t" : "\\n";
-        f << (i + 1) << "       SQLCHAR       0       8000      \""
-          << terminator << "\"     " << (i + 1) << "     " << col_names[i] << "       \"\"\n";
-    }
-
-    f.close();
-    return true;
-}
-
-// Invoke bcp.exe to bulk-load a data file into a table using a format file.
-// Returns true on success, sets error_message on failure.
-static bool InvokeBcp(const MssqlConnInfo &info, const string &table_name,
-                       const string &csv_path, const string &fmt_path,
-                       string &error_message, int64_t &rows_loaded) {
-    rows_loaded = 0;
-
-    // Build bcp command using format file for correct \n row terminator
-    // bcp <db>.dbo.<table> in <file> -S <server> -f <fmt> -k -b 5000
-    string cmd = "bcp " + info.database + ".dbo." + table_name + " in \"" + csv_path + "\"" +
-                 " -S " + info.server +
-                 " -f \"" + fmt_path + "\" -k -b 5000";
-
-    if (info.trusted) {
-        cmd += " -T";
-    } else {
-        cmd += " -U " + info.user + " -P " + info.password;
-    }
-
-    // Redirect stderr to stdout to capture all output
-    cmd += " 2>&1";
-
-    // Execute and capture output
-    string output;
-#ifdef _WIN32
-    FILE *pipe = _popen(cmd.c_str(), "r");
-#else
-    FILE *pipe = popen(cmd.c_str(), "r");
-#endif
-    if (!pipe) {
-        error_message = "Failed to execute bcp command";
-        return false;
-    }
-
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        output += buffer;
-    }
-
-#ifdef _WIN32
-    int exit_code = _pclose(pipe);
-#else
-    int exit_code = pclose(pipe);
-#endif
-
-    if (exit_code != 0) {
-        // Truncate output for error message
-        if (output.size() > 500) output = output.substr(0, 500) + "...";
-        error_message = "bcp failed (exit " + std::to_string(exit_code) + "): " + output;
-        return false;
-    }
-
-    // Parse "N rows copied" from bcp output
-    auto pos = output.find("rows copied");
-    if (pos != string::npos) {
-        // Walk backwards from "rows copied" to find the number
-        auto num_end = pos;
-        while (num_end > 0 && output[num_end - 1] == ' ') num_end--;
-        auto num_start = num_end;
-        while (num_start > 0 && std::isdigit(output[num_start - 1])) num_start--;
-        if (num_start < num_end) {
-            rows_loaded = std::stoll(output.substr(num_start, num_end - num_start));
-        }
-    }
-
-    return true;
+    return GenerateBcpFormatFile(fmt_path, col_names, error_message);
 }
 
 // Full bcp transfer: export staging → bcp → cleanup.
@@ -1287,13 +1084,13 @@ static bool BcpTransferPrimanota(Connection &staging_conn, ClientContext &contex
     }
 
     // 3. Generate format file (defines \n row terminator to match DuckDB export)
-    if (!GenerateBcpFormatFile(fmt_path, error_message)) {
+    if (!GeneratePrimanotaFormatFile(fmt_path, error_message)) {
         std::filesystem::remove(csv_path);
         return false;
     }
 
     // 4. Invoke bcp with format file
-    bool success = InvokeBcp(conn_info, "tblPrimanota", csv_path, fmt_path, error_message, rows_transferred);
+    bool success = InvokeBcp(conn_info, conn_info.database + ".dbo.tblPrimanota", csv_path, fmt_path, error_message, rows_transferred);
 
     // 5. Cleanup temp files
     std::filesystem::remove(csv_path);
@@ -1358,7 +1155,7 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
             batch += pending_stmts[i];
         }
         pending_stmts.clear();
-        if (!ExecuteMssqlStatementWithConn(txn_conn, batch, error_message)) {
+        if (!ExecuteMssqlStatement(txn_conn, batch, error_message)) {
             error_message = "Failed to insert batch into tblPrimanota: " + error_message;
             return false;
         }
@@ -1392,9 +1189,9 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
             values_sql += ')';
             rows_in_batch++;
 
-            if (rows_in_batch >= MSSQL_INSERT_BATCH_SIZE) {
+            if (rows_in_batch >= MSSQL_BULK_INSERT_BATCH_SIZE) {
                 flush_stmt();
-                if (pending_stmts.size() >= MSSQL_STMTS_PER_ROUNDTRIP) {
+                if (pending_stmts.size() >= MSSQL_BULK_STMTS_PER_ROUNDTRIP) {
                     if (!flush_roundtrip()) return false;
                 }
             }
@@ -1445,7 +1242,7 @@ static void ParallelTransferPrimanota(DatabaseInstance &db,
             string err;
 
             // Begin per-month transaction
-            if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", err)) {
+            if (!ExecuteMssqlStatement(conn, "BEGIN TRANSACTION", err)) {
                 res.error_message = "Failed to begin transaction for month " + mi.year_month + ": " + err;
                 goto done;
             }
@@ -1457,17 +1254,17 @@ static void ParallelTransferPrimanota(DatabaseInstance &db,
                              " FROM " + STAGING_TABLE_NAME +
                              " WHERE year_month = '" + EscapeSqlString(mi.year_month) + "'";
 
-                if (!ExecuteMssqlStatementWithConn(conn, sql, err)) {
+                if (!ExecuteMssqlStatement(conn, sql, err)) {
                     // Rollback this month's transaction
                     string rb_err;
-                    ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
+                    ExecuteMssqlStatement(conn, "ROLLBACK", rb_err);
                     res.error_message = "Failed to transfer primanota for month " + mi.year_month + ": " + err;
                     goto done;
                 }
             }
 
             // Commit this month
-            if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", err)) {
+            if (!ExecuteMssqlStatement(conn, "COMMIT", err)) {
                 res.error_message = "Failed to commit month " + mi.year_month + ": " + err;
                 goto done;
             }
@@ -1666,7 +1463,7 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
                 << "NULL, 0)";
         }
 
-        if (!ExecuteMssqlStatementWithConn(txn_conn, sql.str(), error_message)) {
+        if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
             error_message = "Failed to batch-insert Vorlauf records: " + error_message;
             return false;
         }
@@ -1686,7 +1483,7 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
                 << "WHERE guiVorlaufID = '" << EscapeSqlString(mi.vorlauf_id) << "'";
         }
 
-        if (!ExecuteMssqlStatementWithConn(txn_conn, sql.str(), error_message)) {
+        if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
             error_message = "Failed to batch-update Vorlauf records: " + error_message;
             return false;
         }
@@ -2101,7 +1898,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             auto vorlauf_batch_start = std::chrono::high_resolution_clock::now();
 
             Connection txn_conn(db);
-            if (!ExecuteMssqlStatementWithConn(txn_conn, "BEGIN TRANSACTION", error_msg)) {
+            if (!ExecuteMssqlStatement(txn_conn, "BEGIN TRANSACTION", error_msg)) {
                 CleanupAndError(state, bind_data, output, "ERROR", "Failed to begin vorlauf transaction: " + error_msg);
                 return;
             }
@@ -2113,12 +1910,12 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                                             bind_data.str_angelegt, state.months,
                                             vorlauf_results, error_msg)) {
                 string rb_err;
-                ExecuteMssqlStatementWithConn(txn_conn, "ROLLBACK", rb_err);
+                ExecuteMssqlStatement(txn_conn, "ROLLBACK", rb_err);
                 CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg);
                 return;
             }
 
-            if (!ExecuteMssqlStatementWithConn(txn_conn, "COMMIT", error_msg)) {
+            if (!ExecuteMssqlStatement(txn_conn, "COMMIT", error_msg)) {
                 CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit vorlauf batch: " + error_msg);
                 return;
             }
@@ -2139,7 +1936,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             // Single-vorlauf: BEGIN TX → insert/update (TX stays open for TRANSFER phase)
             state.txn_conn = make_uniq<Connection>(db);
 
-            if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
+            if (!ExecuteMssqlStatement(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
                 state.txn_conn.reset();
                 CleanupAndError(state, bind_data, output, "ERROR", "Failed to begin transaction: " + error_msg);
                 return;
@@ -2231,7 +2028,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     auto &mi = state.months[mi_idx];
                     auto month_start = std::chrono::high_resolution_clock::now();
 
-                    if (!ExecuteMssqlStatementWithConn(conn, "BEGIN TRANSACTION", error_msg)) {
+                    if (!ExecuteMssqlStatement(conn, "BEGIN TRANSACTION", error_msg)) {
                         CleanupAndError(state, bind_data, output, "tblPrimanota",
                             "Failed to begin transaction for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
                         return;
@@ -2240,13 +2037,13 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     if (!BulkTransferPrimanota(conn, *state.staging_conn, bind_data.secret_name,
                                                 error_msg, mi.year_month)) {
                         string rb_err;
-                        ExecuteMssqlStatementWithConn(conn, "ROLLBACK", rb_err);
+                        ExecuteMssqlStatement(conn, "ROLLBACK", rb_err);
                         CleanupAndError(state, bind_data, output, "tblPrimanota",
                             "Failed to transfer primanota for month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
                         return;
                     }
 
-                    if (!ExecuteMssqlStatementWithConn(conn, "COMMIT", error_msg)) {
+                    if (!ExecuteMssqlStatement(conn, "COMMIT", error_msg)) {
                         CleanupAndError(state, bind_data, output, "tblPrimanota",
                             "Failed to commit month " + mi.year_month + ": " + error_msg, mi.vorlauf_id);
                         return;
@@ -2280,7 +2077,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             bool used_bcp = false;
 
             // For single-vorlauf, commit the open transaction first so bcp can insert
-            if (ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+            if (ExecuteMssqlStatement(*state.txn_conn, "COMMIT", error_msg)) {
                 if (BcpTransferPrimanota(*state.staging_conn, context, bind_data.secret_name,
                                           bcp_err, bcp_rows)) {
                     used_bcp = true;
@@ -2297,7 +2094,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                 AddSuccessResult(bind_data, "tblPrimanota (bcp)", bcp_rows, state.vorlauf_id, transfer_dur);
             } else {
                 // Fallback: re-open transaction and use INSERT VALUES
-                if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
+                if (!ExecuteMssqlStatement(*state.txn_conn, "BEGIN TRANSACTION", error_msg)) {
                     CleanupAndError(state, bind_data, output, "ERROR", "Failed to re-begin transaction: " + error_msg, state.vorlauf_id);
                     return;
                 }
@@ -2307,7 +2104,7 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     return;
                 }
 
-                if (!ExecuteMssqlStatementWithConn(*state.txn_conn, "COMMIT", error_msg)) {
+                if (!ExecuteMssqlStatement(*state.txn_conn, "COMMIT", error_msg)) {
                     state.txn_conn.reset();
                     CleanupAndError(state, bind_data, output, "ERROR", "Failed to commit: " + error_msg, state.vorlauf_id);
                     return;

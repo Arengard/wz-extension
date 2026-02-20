@@ -59,5 +59,6 @@ bool ValidateForeignKeys(ClientContext &context,
 
 // Table function registration
 void RegisterIntoWzFunction(DatabaseInstance &db);
+void RegisterMoveToMssqlFunction(DatabaseInstance &db);
 
 } // namespace duckdb

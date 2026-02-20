@@ -4,7 +4,10 @@ A DuckDB extension for importing data into WZ (Wirtschaftszahlen) MSSQL tables w
 
 ## Overview
 
-This extension provides the `into_wz` function that:
+This extension provides two table functions:
+
+### `into_wz` — WZ Accounting Import
+The `into_wz` function:
 - Reads source data from any DuckDB table or query result
 - Automatically creates `tblVorlauf` records (derives date range, generates UUID)
 - Maps and inserts `tblPrimanota` records with proper column mapping
@@ -12,6 +15,15 @@ This extension provides the `into_wz` function that:
 - Checks for duplicate `guiPrimanotaID` before insert
 - Uses transactions for data integrity (all-or-nothing)
 - Provides detailed error messages on failure
+
+### `move_to_mssql` — Bulk Table Transfer
+The `move_to_mssql` function:
+- Transfers DuckDB tables to MSSQL Server in bulk
+- Supports transferring all tables, specific tables, or all-except-excluded tables
+- DROPs and recreates target tables with auto-mapped column types
+- Uses BCP bulk copy for maximum speed, with batched INSERT VALUES as fallback
+- Reports per-table results (rows transferred, method used, duration, errors)
+- Continues on per-table errors and reports failures at the end
 
 ## Prerequisites
 
@@ -175,7 +187,75 @@ Example output with `monatsvorlauf := true` (one Vorlauf per month):
 └──────────────┴───────────────┴──────────────────────────────────────┴──────────────────┴─────────┴───────────────┘
 ```
 
-## Source Data Format
+### `move_to_mssql`
+
+Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target table, then loads data via BCP (with INSERT VALUES fallback).
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `secret` | VARCHAR | **Yes** | - | Name of the MSSQL connection secret |
+| `all_tables` | BOOLEAN | No | `true` | Transfer all tables in DuckDB |
+| `tables` | LIST(VARCHAR) | No | `[]` | Explicit list of table names to transfer (sets `all_tables` to false) |
+| `exclude` | LIST(VARCHAR) | No | `[]` | Tables to exclude when `all_tables` is true |
+| `schema` | VARCHAR | No | `dbo` | Target schema on MSSQL Server |
+
+#### Return Value
+
+Returns a table with transfer status for each table plus a summary row:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `table_name` | VARCHAR | Name of the table (or `SUMMARY`) |
+| `rows_transferred` | BIGINT | Number of rows transferred |
+| `method` | VARCHAR | Transfer method used (`BCP` or `INSERT`) |
+| `duration` | VARCHAR | Time taken (hh:mm:ss) |
+| `success` | BOOLEAN | Whether the transfer succeeded |
+| `error_message` | VARCHAR | Error details if failed |
+
+#### Examples
+
+```sql
+-- Transfer all DuckDB tables to MSSQL
+SELECT * FROM move_to_mssql(secret='my_mssql_secret');
+
+-- Transfer specific tables only
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    all_tables=false,
+    tables=['orders', 'customers', 'products']
+);
+
+-- Transfer all tables except some
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    exclude=['temp_staging', 'debug_log']
+);
+
+-- Transfer to a custom schema
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    schema='staging'
+);
+```
+
+#### Example Output
+
+```
+┌──────────────┬──────────────────┬────────┬──────────┬─────────┬───────────────┐
+│ table_name   │ rows_transferred │ method │ duration │ success │ error_message │
+├──────────────┼──────────────────┼────────┼──────────┼─────────┼───────────────┤
+│ orders       │ 15000            │ BCP    │ 00:00:03 │ true    │               │
+│ customers    │ 500              │ BCP    │ 00:00:01 │ true    │               │
+│ products     │ 200              │ INSERT │ 00:00:01 │ true    │               │
+│ SUMMARY      │ 15700            │        │ 00:00:05 │ true    │               │
+└──────────────┴──────────────────┴────────┴──────────┴─────────┴───────────────┘
+```
+
+---
+
+## Source Data Format (into_wz)
 
 The source table should contain Primanota booking records. Column names are matched case-insensitively.
 
@@ -476,9 +556,11 @@ wz-extension/
 ├── src/
 │   ├── include/
 │   │   ├── wz_extension.hpp      # Headers and structs
-│   │   └── wz_utils.hpp          # Shared utilities (column aliases, SQL helpers)
+│   │   ├── wz_utils.hpp          # Shared utilities (column aliases, SQL helpers)
+│   │   └── mssql_utils.hpp       # Shared MSSQL/BCP utilities (connection, bulk transfer)
 │   ├── wz_extension.cpp          # Extension entry point
-│   ├── into_wz_function.cpp      # Main function implementation
+│   ├── into_wz_function.cpp      # into_wz function implementation
+│   ├── move_to_mssql_function.cpp # move_to_mssql function implementation
 │   └── constraint_checker.cpp    # FK constraint validation
 ├── duckdb/                       # DuckDB submodule
 ├── extension-ci-tools/           # Build infrastructure

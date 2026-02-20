@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/wz_extension.cpp
     src/into_wz_function.cpp
     src/constraint_checker.cpp
+    src/move_to_mssql_function.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

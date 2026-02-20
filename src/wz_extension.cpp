@@ -16,6 +16,7 @@ void WzExtension::Load(ExtensionLoader &loader) {
 
     // Register the into_wz table function
     RegisterIntoWzFunction(db);
+    RegisterMoveToMssqlFunction(db);
 }
 
 std::string WzExtension::Name() {
@@ -35,12 +36,14 @@ DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
     duckdb::ExtensionHelper::AutoLoadExtension(db, "mssql");
     duckdb::RegisterIntoWzFunction(db);
+    duckdb::RegisterMoveToMssqlFunction(db);
 }
 
 // Legacy entry point (kept for compatibility)
 DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
     duckdb::ExtensionHelper::AutoLoadExtension(db, "mssql");
     duckdb::RegisterIntoWzFunction(db);
+    duckdb::RegisterMoveToMssqlFunction(db);
 }
 
 DUCKDB_EXTENSION_API const char *wz_version() {
