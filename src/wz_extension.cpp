@@ -8,13 +8,18 @@
 
 namespace duckdb {
 
+static void TryAutoLoadMssql(DatabaseInstance &db) {
+    try {
+        ExtensionHelper::AutoLoadExtension(db, "mssql");
+    } catch (...) {
+        // MSSQL extension is a third-party dependency that may not be installed.
+        // It will be needed at runtime when into_wz() or move_to_mssql() is called.
+    }
+}
+
 void WzExtension::Load(ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
-
-    // Auto-load the MSSQL extension (required dependency)
-    ExtensionHelper::AutoLoadExtension(db, "mssql");
-
-    // Register the into_wz table function
+    TryAutoLoadMssql(db);
     RegisterIntoWzFunction(db);
     RegisterMoveToMssqlFunction(db);
 }
@@ -34,14 +39,14 @@ extern "C" {
 // New C++ extension entry point (required for C++ ABI)
 DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
-    duckdb::ExtensionHelper::AutoLoadExtension(db, "mssql");
+    duckdb::TryAutoLoadMssql(db);
     duckdb::RegisterIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
 }
 
 // Legacy entry point (kept for compatibility)
 DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
-    duckdb::ExtensionHelper::AutoLoadExtension(db, "mssql");
+    duckdb::TryAutoLoadMssql(db);
     duckdb::RegisterIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
 }
