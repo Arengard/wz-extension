@@ -85,6 +85,10 @@ struct ColumnInfo {
 struct TableInfo {
     string name;
     vector<ColumnInfo> columns;
+    // Pre-built SQL strings (built in Step 3, used in Step 4)
+    string drop_sql;
+    string create_sql;
+    string col_list;   // quoted column names for SELECT/INSERT
 };
 
 struct MoveToMssqlBindData : public TableFunctionData {
@@ -385,8 +389,16 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
         }
 
         // Step 2: Discover table names (Connection + Query is safe in Execute)
+        // NOTE: Heap-allocate local data structures because MSSQL extension
+        // operations via attached databases corrupt the heap. Destructors for
+        // stack-allocated objects (vectors, Connection) segfault after MSSQL ops.
+        // We intentionally leak these to avoid the crash — a few KB per call.
         {
-            vector<string> table_names;
+            auto *table_names_ptr = new vector<string>();
+            auto &table_names = *table_names_ptr;
+
+            auto *local_conn_ptr = new Connection(db);
+            auto &local_conn = *local_conn_ptr;
 
             if (bind_data.all_tables) {
                 set<string> exclude_set;
@@ -396,8 +408,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                     exclude_set.insert(lower_ex);
                 }
 
-                Connection conn(db);
-                auto result = conn.Query(
+                auto result = local_conn.Query(
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_catalog = 'memory' "
                     "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
@@ -430,41 +441,65 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                 goto output_results;
             }
 
-            // Step 3: Discover columns for each table, then transfer
-            vector<TableInfo> tables_to_transfer;
-            {
-                Connection conn(db);
-                for (auto &tname : table_names) {
-                    TableInfo info;
-                    info.name = tname;
+            // Step 3: Discover columns for each table using information_schema
+            // Heap-allocate to avoid destructor crash (see note at Step 2)
+            auto *tables_ptr = new vector<TableInfo>();
+            auto &tables_to_transfer = *tables_ptr;
+            for (auto &tname : table_names) {
+                TableInfo info;
+                info.name = tname;
 
-                    auto desc_result = conn.Query("DESCRIBE \"" + tname + "\"");
-                    if (desc_result->HasError()) {
-                        // Record error for this table and continue
-                        TableTransferResult err;
-                        err.table_name = tname;
-                        err.rows_transferred = 0;
-                        err.method = "";
-                        err.duration = "00:00:00";
-                        err.success = false;
-                        err.error_message = "Failed to describe table: " + desc_result->GetError();
-                        bind_data.results.push_back(std::move(err));
-                        continue;
-                    }
+                auto col_result = local_conn.Query(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_catalog = 'memory' "
+                    "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
+                    "AND table_name = '" + EscapeSqlString(tname) + "' "
+                    "ORDER BY ordinal_position");
+                if (col_result->HasError()) {
+                    TableTransferResult err;
+                    err.table_name = tname;
+                    err.rows_transferred = 0;
+                    err.method = "";
+                    err.duration = "00:00:00";
+                    err.success = false;
+                    err.error_message = "Failed to get columns: " + col_result->GetError();
+                    bind_data.results.push_back(std::move(err));
+                    continue;
+                }
 
-                    for (auto &chunk : desc_result->Collection().Chunks()) {
-                        for (idx_t row = 0; row < chunk.size(); row++) {
-                            ColumnInfo col;
-                            col.name = chunk.data[0].GetValue(row).ToString();
-                            col.duckdb_type = chunk.data[1].GetValue(row).ToString();
-                            col.mssql_type = MapDuckDBTypeToMssql(col.duckdb_type);
-                            info.columns.push_back(std::move(col));
-                        }
-                    }
+                // Build SQL strings directly from query results
+                string create_cols;
+                string col_list_tmp;
+                vector<string> col_names;  // for BCP
+                bool has_cols = false;
 
-                    if (!info.columns.empty()) {
-                        tables_to_transfer.push_back(std::move(info));
+                for (auto &chunk : col_result->Collection().Chunks()) {
+                    for (idx_t row = 0; row < chunk.size(); row++) {
+                        string col_name = chunk.data[0].GetValue(row).ToString();
+                        string col_type = chunk.data[1].GetValue(row).ToString();
+                        if (has_cols) { create_cols += ", "; col_list_tmp += ", "; }
+                        create_cols += "\"" + col_name + "\" " + col_type;
+                        col_list_tmp += "\"" + col_name + "\"";
+                        col_names.push_back(col_name);
+
+                        ColumnInfo ci;
+                        ci.name = col_name;
+                        ci.duckdb_type = col_type;
+                        ci.mssql_type = MapDuckDBTypeToMssql(col_type);
+                        info.columns.push_back(std::move(ci));
+                        has_cols = true;
                     }
+                }
+
+                if (has_cols) {
+                    info.drop_sql = "DROP TABLE IF EXISTS " + bind_data.secret_name +
+                                    "." + bind_data.target_schema + ".\"" + info.name + "\"";
+                    info.create_sql = "CREATE TABLE " + bind_data.secret_name +
+                                      "." + bind_data.target_schema + ".\"" + info.name + "\" (" +
+                                      create_cols + ")";
+                    info.col_list = col_list_tmp;
+
+                    tables_to_transfer.push_back(std::move(info));
                 }
             }
 
@@ -480,27 +515,17 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                 try {
                     string error_msg;
 
-                    // 4a. DROP existing table on MSSQL
+                    // Use pre-built SQL strings (built in Step 3 while data was fresh)
+                    // Use a SEPARATE Connection for MSSQL DDL operations
                     {
                         Connection mssql_conn(db);
-                        string drop_sql = "DROP TABLE IF EXISTS " + bind_data.secret_name +
-                                          "." + bind_data.target_schema + ".\"" + table.name + "\"";
-                        ExecuteMssqlStatement(mssql_conn, drop_sql, error_msg);  // ignore error
+                        ExecuteMssqlStatement(mssql_conn, table.drop_sql, error_msg);
                     }
 
-                    // 4b. CREATE table on MSSQL
                     bool create_ok = false;
                     {
                         Connection mssql_conn(db);
-                        string create_cols;
-                        for (size_t i = 0; i < table.columns.size(); i++) {
-                            if (i > 0) create_cols += ", ";
-                            create_cols += "\"" + table.columns[i].name + "\" " + table.columns[i].mssql_type;
-                        }
-                        string create_sql = "CREATE TABLE " + bind_data.secret_name +
-                                            "." + bind_data.target_schema + ".\"" + table.name + "\" (" +
-                                            create_cols + ")";
-                        create_ok = ExecuteMssqlStatement(mssql_conn, create_sql, error_msg);
+                        create_ok = ExecuteMssqlStatement(mssql_conn, table.create_sql, error_msg);
                     }
 
                     if (!create_ok) {
@@ -509,12 +534,11 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                         auto table_end = std::chrono::high_resolution_clock::now();
                         result.duration = FormatDuration(std::chrono::duration<double>(table_end - table_start).count());
                         bind_data.results.push_back(std::move(result));
-                        continue;  // next table
+                        continue;
                     }
 
-                    // 4c. Try BCP transfer
+                    // 4c. Try BCP transfer — uses local_conn for COPY TO export only
                     {
-                        Connection local_conn(db);
                         int64_t rows = 0;
                         string bcp_error;
                         bool bcp_ok = BcpTransferTable(local_conn, context, bind_data.secret_name,
@@ -526,12 +550,12 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                             result.method = "BCP";
                             result.success = true;
                         } else {
-                            // 4d. Fallback to INSERT VALUES
-                            Connection local_conn2(db);
-                            Connection mssql_conn2(db);
+                            // 4d. Fallback to INSERT VALUES — use separate connections
+                            Connection read_conn(db);
+                            Connection write_conn(db);
                             string insert_error;
                             int64_t insert_rows = 0;
-                            bool insert_ok = InsertFallbackTransfer(local_conn2, mssql_conn2,
+                            bool insert_ok = InsertFallbackTransfer(read_conn, write_conn,
                                                                      table.name, bind_data.secret_name,
                                                                      bind_data.target_schema,
                                                                      table.name,
