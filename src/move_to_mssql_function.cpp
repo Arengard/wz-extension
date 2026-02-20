@@ -86,9 +86,13 @@ struct TableInfo {
     string name;
     vector<ColumnInfo> columns;
     // Pre-built SQL strings (built in Step 3, used in Step 4)
+    // IMPORTANT: All fields below MUST be populated in Step 3 before any MSSQL
+    // operations. MSSQL extension DDL corrupts the heap, so vectors/strings
+    // read after DDL ops return garbage. Only use these pre-built values in Step 4.
     string drop_sql;
     string create_sql;
-    string col_list;   // quoted column names for SELECT/INSERT
+    string col_list;           // quoted column names for SELECT/INSERT
+    vector<string> col_names;  // unquoted column names for BCP format file
 };
 
 struct MoveToMssqlBindData : public TableFunctionData {
@@ -190,7 +194,8 @@ static bool BcpTransferTable(Connection &local_conn, ClientContext &context,
                               const string &source_table,
                               const string &schema,
                               const string &mssql_table_name,
-                              const vector<ColumnInfo> &columns,
+                              const vector<string> &col_names,
+                              const string &col_list,
                               string &error_message,
                               int64_t &rows_transferred) {
     rows_transferred = 0;
@@ -199,16 +204,6 @@ static bool BcpTransferTable(Connection &local_conn, ClientContext &context,
     if (!GetMssqlConnInfo(context, secret_name, conn_info)) {
         error_message = "Could not extract MSSQL connection info from secret";
         return false;
-    }
-
-    // Build column list for export
-    vector<string> col_names;
-    col_names.reserve(columns.size());
-    string col_list;
-    for (size_t i = 0; i < columns.size(); i++) {
-        col_names.push_back(columns[i].name);
-        if (i > 0) col_list += ", ";
-        col_list += "\"" + columns[i].name + "\"";
     }
 
     // Export to TSV
@@ -254,22 +249,13 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
                                     const string &db_name,
                                     const string &schema,
                                     const string &mssql_table_name,
-                                    const vector<ColumnInfo> &columns,
+                                    const string &col_list,
                                     string &error_message,
                                     int64_t &rows_transferred) {
     rows_transferred = 0;
 
-    // Column lists
-    string mssql_col_list;
-    string select_cols;
-    for (size_t i = 0; i < columns.size(); i++) {
-        if (i > 0) { mssql_col_list += ", "; select_cols += ", "; }
-        mssql_col_list += "\"" + columns[i].name + "\"";
-        select_cols += "\"" + columns[i].name + "\"";
-    }
-
     // Read source
-    string select_sql = "SELECT " + select_cols + " FROM \"" + source_table + "\"";
+    string select_sql = "SELECT " + col_list + " FROM \"" + source_table + "\"";
     auto result = local_conn.Query(select_sql);
     if (result->HasError()) {
         error_message = "Failed to read source table: " + result->GetError();
@@ -278,7 +264,7 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
 
     idx_t col_count = result->types.size();
     string insert_prefix = "INSERT INTO " + db_name + "." + schema + ".\"" +
-                           mssql_table_name + "\" (" + mssql_col_list + ") VALUES ";
+                           mssql_table_name + "\" (" + col_list + ") VALUES ";
 
     vector<string> pending_stmts;
     idx_t rows_in_batch = 0;
@@ -498,6 +484,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                                       "." + bind_data.target_schema + ".\"" + info.name + "\" (" +
                                       create_cols + ")";
                     info.col_list = col_list_tmp;
+                    info.col_names = col_names;
 
                     tables_to_transfer.push_back(std::move(info));
                 }
@@ -543,7 +530,8 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                         string bcp_error;
                         bool bcp_ok = BcpTransferTable(local_conn, context, bind_data.secret_name,
                                                         table.name, bind_data.target_schema, table.name,
-                                                        table.columns, bcp_error, rows);
+                                                        table.col_names, table.col_list,
+                                                        bcp_error, rows);
 
                         if (bcp_ok) {
                             result.rows_transferred = rows;
@@ -559,7 +547,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                                                                      table.name, bind_data.secret_name,
                                                                      bind_data.target_schema,
                                                                      table.name,
-                                                                     table.columns,
+                                                                     table.col_list,
                                                                      insert_error, insert_rows);
                             if (insert_ok) {
                                 result.rows_transferred = insert_rows;
