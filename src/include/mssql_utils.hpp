@@ -191,10 +191,11 @@ inline bool InvokeBcp(const MssqlConnInfo &info, const string &full_table_name,
     rows_loaded = 0;
 
     // Build bcp command using format file for correct \n row terminator
-    // bcp <full_table_name> in <file> -S <server> -f <fmt> -k -b 5000
+    // -C 65001: interpret data file as UTF-8 (DuckDB COPY TO outputs UTF-8)
+    // bcp <full_table_name> in <file> -S <server> -f <fmt> -C 65001 -k -b 5000
     string cmd = "bcp " + full_table_name + " in \"" + csv_path + "\"" +
                  " -S " + info.server +
-                 " -f \"" + fmt_path + "\" -k -b 5000";
+                 " -f \"" + fmt_path + "\" -C 65001 -k -b 5000";
 
     if (info.trusted) {
         cmd += " -T";
