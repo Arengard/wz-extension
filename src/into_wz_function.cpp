@@ -1827,6 +1827,58 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
         double uuid_dur = std::chrono::duration<double>(uuid_end - uuid_start).count();
         AddSuccessResult(bind_data, "TIMING:uuid_gen", static_cast<int64_t>(bind_data.source_rows.size()), "", uuid_dur);
 
+        // Check for duplicate primanota IDs within the batch itself
+        {
+            std::unordered_map<string, size_t> seen_ids;  // id -> first occurrence row index
+            vector<string> intra_batch_dups;
+
+            auto check_ids = [&](const vector<string> &ids, const vector<idx_t> *row_indices) {
+                for (size_t i = 0; i < ids.size(); i++) {
+                    size_t row_idx = row_indices ? (*row_indices)[i] : i;
+                    auto it = seen_ids.find(ids[i]);
+                    if (it != seen_ids.end()) {
+                        if (intra_batch_dups.size() < MAX_DUPLICATES_TO_DISPLAY) {
+                            intra_batch_dups.push_back(
+                                ids[i] + " (source rows " + std::to_string(it->second + 1) +
+                                " and " + std::to_string(row_idx + 1) + ")");
+                        } else {
+                            intra_batch_dups.push_back("");  // count only
+                        }
+                    } else {
+                        seen_ids[ids[i]] = row_idx;
+                    }
+                }
+            };
+
+            if (bind_data.monatsvorlauf) {
+                for (auto &mi : state.months) {
+                    check_ids(mi.primanota_ids, &mi.row_indices);
+                }
+            } else {
+                check_ids(state.primanota_ids, nullptr);
+            }
+
+            if (!intra_batch_dups.empty()) {
+                string dup_list;
+                size_t display_count = std::min(intra_batch_dups.size(), MAX_DUPLICATES_TO_DISPLAY);
+                for (size_t i = 0; i < display_count; i++) {
+                    if (i > 0) dup_list += ", ";
+                    dup_list += intra_batch_dups[i];
+                }
+                if (intra_batch_dups.size() > MAX_DUPLICATES_TO_DISPLAY) {
+                    dup_list += " (and " + std::to_string(intra_batch_dups.size() - MAX_DUPLICATES_TO_DISPLAY) + " more)";
+                }
+                string msg = "Duplicate guiPrimanotaID within source data: " + dup_list +
+                    ". " + std::to_string(intra_batch_dups.size()) +
+                    " rows produce the same ID. This usually means duplicate rows exist in the source table."
+                    " Remove duplicates before importing.";
+                AddErrorResult(bind_data, "ERROR", msg);
+                state.phase = ExecutionPhase::OUTPUT_RESULTS;
+                OutputResults(bind_data, state, output);
+                return;
+            }
+        }
+
         state.phase = ExecutionPhase::POPULATE_STAGING;
         state.progress = 50.0;
         OutputResults(bind_data, state, output);
