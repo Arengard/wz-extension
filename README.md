@@ -199,7 +199,10 @@ Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target ta
 | `all_tables` | BOOLEAN | No | `true` | Transfer all tables in DuckDB |
 | `tables` | LIST(VARCHAR) | No | `[]` | Explicit list of table names to transfer (sets `all_tables` to false) |
 | `exclude` | LIST(VARCHAR) | No | `[]` | Tables to exclude when `all_tables` is true |
-| `schema` | VARCHAR | No | `dbo` | Target schema on MSSQL Server |
+| `schema` | VARCHAR | No | `dbo` | Target schema on MSSQL Server (alias: `mssql_schema`) |
+| `mssql_schema` | VARCHAR | No | `dbo` | Alias for `schema` — target schema on MSSQL Server |
+| `duckdb_schema` | VARCHAR | No | `main` | Source schema in DuckDB |
+| `duckdb_catalog` | VARCHAR | No | `memory` | Source catalog in DuckDB |
 
 #### Return Value
 
@@ -233,10 +236,19 @@ SELECT * FROM move_to_mssql(
     exclude=['temp_staging', 'debug_log']
 );
 
--- Transfer to a custom schema
+-- Transfer to a custom MSSQL schema
 SELECT * FROM move_to_mssql(
     secret='my_mssql_secret',
-    schema='staging'
+    mssql_schema='staging'
+);
+
+-- Transfer from a specific DuckDB schema/catalog
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    duckdb_catalog='my_db',
+    duckdb_schema='analytics',
+    mssql_schema='dbo',
+    tables=['orders', 'customers']
 );
 ```
 

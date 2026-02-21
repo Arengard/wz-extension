@@ -99,6 +99,7 @@ struct MoveToMssqlBindData : public TableFunctionData {
     string secret_name;
     string target_schema;
     string duckdb_schema;
+    string duckdb_catalog;
     bool all_tables;
     vector<string> explicit_tables;
     vector<string> exclude_tables;
@@ -126,6 +127,7 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
     bind_data->secret_name = "mssql_conn";
     bind_data->target_schema = "dbo";
     bind_data->duckdb_schema = "main";
+    bind_data->duckdb_catalog = "memory";
     bind_data->all_tables = true;
 
     for (auto &kv : input.named_parameters) {
@@ -134,8 +136,10 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
 
         if (lower_name == "secret") {
             bind_data->secret_name = kv.second.GetValue<string>();
-        } else if (lower_name == "schema") {
+        } else if (lower_name == "schema" || lower_name == "mssql_schema") {
             bind_data->target_schema = kv.second.GetValue<string>();
+        } else if (lower_name == "duckdb_catalog") {
+            bind_data->duckdb_catalog = kv.second.GetValue<string>();
         } else if (lower_name == "duckdb_schema") {
             bind_data->duckdb_schema = kv.second.GetValue<string>();
         } else if (lower_name == "all_tables") {
@@ -167,6 +171,9 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
     if (!IsValidSqlIdentifier(bind_data->duckdb_schema)) {
         throw BinderException("move_to_mssql: invalid duckdb_schema name: " + bind_data->duckdb_schema);
     }
+    if (!IsValidSqlIdentifier(bind_data->duckdb_catalog)) {
+        throw BinderException("move_to_mssql: invalid duckdb_catalog name: " + bind_data->duckdb_catalog);
+    }
 
     // Define output columns — no database access needed here
     names = {"table_name", "rows_transferred", "method", "duration", "success", "error_message"};
@@ -196,6 +203,8 @@ static bool BcpTransferTable(Connection &local_conn, ClientContext &context,
                               const string &mssql_table_name,
                               const vector<string> &col_names,
                               const string &col_list,
+                              const string &duckdb_catalog,
+                              const string &duckdb_schema,
                               string &error_message,
                               int64_t &rows_transferred) {
     rows_transferred = 0;
@@ -215,7 +224,8 @@ static bool BcpTransferTable(Connection &local_conn, ClientContext &context,
     string csv_path = (temp_dir / ("mssql_transfer_" + safe_name + ".tsv")).string();
     string fmt_path = (temp_dir / ("mssql_transfer_" + safe_name + ".fmt")).string();
 
-    string export_sql = "COPY (SELECT " + col_list + " FROM \"" + source_table +
+    string duckdb_prefix = "\"" + duckdb_catalog + "\".\"" + duckdb_schema + "\".";
+    string export_sql = "COPY (SELECT " + col_list + " FROM " + duckdb_prefix + "\"" + source_table +
                         "\") TO '" + csv_path + "' (DELIMITER '\t', HEADER false, NULL '', QUOTE '')";
     auto export_result = local_conn.Query(export_sql);
     if (export_result->HasError()) {
@@ -250,12 +260,15 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
                                     const string &schema,
                                     const string &mssql_table_name,
                                     const string &col_list,
+                                    const string &duckdb_catalog,
+                                    const string &duckdb_schema,
                                     string &error_message,
                                     int64_t &rows_transferred) {
     rows_transferred = 0;
 
     // Read source
-    string select_sql = "SELECT " + col_list + " FROM \"" + source_table + "\"";
+    string duckdb_prefix = "\"" + duckdb_catalog + "\".\"" + duckdb_schema + "\".";
+    string select_sql = "SELECT " + col_list + " FROM " + duckdb_prefix + "\"" + source_table + "\"";
     auto result = local_conn.Query(select_sql);
     if (result->HasError()) {
         error_message = "Failed to read source table: " + result->GetError();
@@ -396,7 +409,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
 
                 auto result = local_conn.Query(
                     "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_catalog = 'memory' "
+                    "WHERE table_catalog = '" + EscapeSqlString(bind_data.duckdb_catalog) + "' "
                     "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
                     "AND table_type = 'BASE TABLE' ORDER BY table_name");
                 if (!result->HasError()) {
@@ -437,7 +450,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
 
                 auto col_result = local_conn.Query(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_catalog = 'memory' "
+                    "WHERE table_catalog = '" + EscapeSqlString(bind_data.duckdb_catalog) + "' "
                     "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
                     "AND table_name = '" + EscapeSqlString(tname) + "' "
                     "ORDER BY ordinal_position");
@@ -531,6 +544,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                         bool bcp_ok = BcpTransferTable(local_conn, context, bind_data.secret_name,
                                                         table.name, bind_data.target_schema, table.name,
                                                         table.col_names, table.col_list,
+                                                        bind_data.duckdb_catalog, bind_data.duckdb_schema,
                                                         bcp_error, rows);
 
                         if (bcp_ok) {
@@ -548,6 +562,7 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                                                                      bind_data.target_schema,
                                                                      table.name,
                                                                      table.col_list,
+                                                                     bind_data.duckdb_catalog, bind_data.duckdb_schema,
                                                                      insert_error, insert_rows);
                             if (insert_ok) {
                                 result.rows_transferred = insert_rows;
@@ -625,7 +640,9 @@ void RegisterMoveToMssqlFunction(DatabaseInstance &db) {
     func.named_parameters["tables"] = LogicalType::LIST(LogicalType::VARCHAR);
     func.named_parameters["exclude"] = LogicalType::LIST(LogicalType::VARCHAR);
     func.named_parameters["schema"] = LogicalType::VARCHAR;
+    func.named_parameters["mssql_schema"] = LogicalType::VARCHAR;
     func.named_parameters["duckdb_schema"] = LogicalType::VARCHAR;
+    func.named_parameters["duckdb_catalog"] = LogicalType::VARCHAR;
 
     Connection con(db);
     con.BeginTransaction();
