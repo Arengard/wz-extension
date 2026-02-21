@@ -4,7 +4,7 @@ A DuckDB extension for importing data into WZ (Wirtschaftszahlen) MSSQL tables w
 
 ## Overview
 
-This extension provides two table functions:
+This extension provides three table functions:
 
 ### `into_wz` — WZ Accounting Import
 The `into_wz` function:
@@ -24,6 +24,13 @@ The `move_to_mssql` function:
 - Uses BCP bulk copy for maximum speed, with batched INSERT VALUES as fallback
 - Reports per-table results (rows transferred, method used, duration, errors)
 - Continues on per-table errors and reports failures at the end
+
+### `stps_drop_all` — Clean DuckDB State
+The `stps_drop_all` function:
+- Drops all views, tables, and user-created schemas in DuckDB
+- Detaches all non-default attached databases
+- Takes no parameters — a "nuke everything" reset function
+- Returns a result table showing each dropped/detached object and its status
 
 ## Prerequisites
 
@@ -263,6 +270,36 @@ SELECT * FROM move_to_mssql(
 │ products     │ 200              │ INSERT │ 00:00:01 │ true    │               │
 │ SUMMARY      │ 15700            │        │ 00:00:05 │ true    │               │
 └──────────────┴──────────────────┴────────┴──────────┴─────────┴───────────────┘
+```
+
+### `stps_drop_all`
+
+Drops all tables, views, and user-created schemas in DuckDB and detaches all non-default databases. Takes no parameters.
+
+#### Return Value
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `object_type` | VARCHAR | Type of object (`VIEW`, `TABLE`, `SCHEMA`, `DATABASE`, or `INFO`) |
+| `object_name` | VARCHAR | Qualified name of the dropped/detached object |
+| `status` | VARCHAR | Result (`DROPPED`, `DETACHED`, or error message) |
+
+#### Example
+
+```sql
+-- Reset DuckDB to a clean state
+SELECT * FROM stps_drop_all();
+```
+
+```
+┌─────────────┬────────────────┬─────────┐
+│ object_type │  object_name   │ status  │
+├─────────────┼────────────────┼─────────┤
+│ VIEW        │ "main"."v1"    │ DROPPED │
+│ TABLE       │ "main"."test1" │ DROPPED │
+│ TABLE       │ "main"."test2" │ DROPPED │
+│ SCHEMA      │ myschema       │ DROPPED │
+└─────────────┴────────────────┴─────────┘
 ```
 
 ---
@@ -572,8 +609,9 @@ wz-extension/
 │   │   └── mssql_utils.hpp       # Shared MSSQL/BCP utilities (connection, bulk transfer)
 │   ├── wz_extension.cpp          # Extension entry point
 │   ├── into_wz_function.cpp      # into_wz function implementation
-│   ├── move_to_mssql_function.cpp # move_to_mssql function implementation
-│   └── constraint_checker.cpp    # FK constraint validation
+│   ├── move_to_mssql_function.cpp  # move_to_mssql function implementation
+│   ├── stps_drop_all_function.cpp # stps_drop_all function implementation
+│   └── constraint_checker.cpp     # FK constraint validation
 ├── duckdb/                       # DuckDB submodule
 ├── extension-ci-tools/           # Build infrastructure
 ├── CMakeLists.txt
