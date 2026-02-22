@@ -18,6 +18,35 @@
 namespace duckdb {
 
 // ============================================================================
+// UTF-8 safe string helpers
+// ============================================================================
+
+// Read a string from a materialized result vector without UTF-8 validation.
+// Uses raw byte access via FlatVector (safe for ColumnDataCollection chunks).
+static string RawGetString(DataChunk &chunk, idx_t col, idx_t row) {
+    auto &validity = FlatVector::Validity(chunk.data[col]);
+    if (!validity.RowIsValid(row)) return "";
+    auto str_data = FlatVector::GetData<string_t>(chunk.data[col]);
+    return str_data[row].GetString();
+}
+
+// Create a DuckDB Value from a string, sanitizing non-UTF-8 bytes.
+// DuckDB requires valid UTF-8 in Value construction; this replaces
+// invalid bytes with '?' to prevent exceptions in result output.
+static Value SafeStringValue(const string &str) {
+    try {
+        return Value(str);
+    } catch (...) {
+        string clean;
+        clean.reserve(str.size());
+        for (unsigned char c : str) {
+            clean += (c < 0x80) ? static_cast<char>(c) : '?';
+        }
+        return Value(clean);
+    }
+}
+
+// ============================================================================
 // DuckDB type -> MSSQL type mapping
 // ============================================================================
 
@@ -528,16 +557,25 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                 query += "ORDER BY table_schema, table_name";
 
                 auto result = local_conn.Query(query);
-                if (!result->HasError()) {
-                    for (auto &chunk : result->Collection().Chunks()) {
-                        for (idx_t row = 0; row < chunk.size(); row++) {
-                            string tschema = chunk.data[0].GetValue(row).ToString();
-                            string tname = chunk.data[1].GetValue(row).ToString();
-                            string tname_lower = tname;
-                            std::transform(tname_lower.begin(), tname_lower.end(), tname_lower.begin(), ::tolower);
-                            if (exclude_set.find(tname_lower) == exclude_set.end()) {
-                                table_sources.push_back({tschema, tname});
-                            }
+                if (result->HasError()) {
+                    TableTransferResult err;
+                    err.table_name = "ERROR";
+                    err.rows_transferred = 0;
+                    err.method = "";
+                    err.duration = "00:00:00";
+                    err.success = false;
+                    err.error_message = "Failed to discover tables: " + result->GetError();
+                    bind_data.results.push_back(std::move(err));
+                    goto output_results;
+                }
+                for (auto &chunk : result->Collection().Chunks()) {
+                    for (idx_t row = 0; row < chunk.size(); row++) {
+                        string tschema = RawGetString(chunk, 0, row);
+                        string tname = RawGetString(chunk, 1, row);
+                        string tname_lower = tname;
+                        std::transform(tname_lower.begin(), tname_lower.end(), tname_lower.begin(), ::tolower);
+                        if (exclude_set.find(tname_lower) == exclude_set.end()) {
+                            table_sources.push_back({tschema, tname});
                         }
                     }
                 }
@@ -602,8 +640,8 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
 
                 for (auto &chunk : col_result->Collection().Chunks()) {
                     for (idx_t row = 0; row < chunk.size(); row++) {
-                        string col_name = chunk.data[0].GetValue(row).ToString();
-                        string col_type = chunk.data[1].GetValue(row).ToString();
+                        string col_name = RawGetString(chunk, 0, row);
+                        string col_type = RawGetString(chunk, 1, row);
                         if (has_cols) { create_cols += ", "; col_list_tmp += ", "; }
                         create_cols += "\"" + col_name + "\" " + col_type;
                         col_list_tmp += "\"" + col_name + "\"";
@@ -808,12 +846,12 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
     idx_t count = 0;
     while (state.current_result_idx < bind_data.results.size() && count < STANDARD_VECTOR_SIZE) {
         auto &r = bind_data.results[state.current_result_idx];
-        output.data[0].SetValue(count, Value(r.table_name));
+        output.data[0].SetValue(count, SafeStringValue(r.table_name));
         output.data[1].SetValue(count, Value::BIGINT(r.rows_transferred));
-        output.data[2].SetValue(count, Value(r.method));
-        output.data[3].SetValue(count, Value(r.duration));
+        output.data[2].SetValue(count, SafeStringValue(r.method));
+        output.data[3].SetValue(count, SafeStringValue(r.duration));
         output.data[4].SetValue(count, Value::BOOLEAN(r.success));
-        output.data[5].SetValue(count, Value(r.error_message));
+        output.data[5].SetValue(count, SafeStringValue(r.error_message));
         count++;
         state.current_result_idx++;
     }
