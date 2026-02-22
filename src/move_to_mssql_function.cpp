@@ -332,16 +332,29 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
             values_sql += '(';
             for (idx_t col = 0; col < col_count; col++) {
                 if (col > 0) values_sql += ',';
-                Value val = chunk.data[col].GetValue(row);
-                if (val.IsNull()) {
+                // Check null via validity mask (no UTF-8 validation)
+                auto &validity = FlatVector::Validity(chunk.data[col]);
+                if (!validity.RowIsValid(row)) {
                     values_sql += "NULL";
                 } else {
                     auto &type = result->types[col];
                     if (type == LogicalType::INTEGER || type == LogicalType::BIGINT ||
                         type == LogicalType::SMALLINT || type == LogicalType::TINYINT ||
                         type == LogicalType::BOOLEAN) {
+                        // Numeric/bool: GetValue is safe (no UTF-8 issues)
+                        Value val = chunk.data[col].GetValue(row);
                         values_sql += val.ToString();
+                    } else if (type.InternalType() == PhysicalType::VARCHAR) {
+                        // String types: raw byte access to bypass UTF-8 validation.
+                        // Data from attached databases may contain non-UTF-8 bytes
+                        // (e.g. Windows-1252 encoded German text with umlauts).
+                        auto str_data = FlatVector::GetData<string_t>(chunk.data[col]);
+                        values_sql += '\'';
+                        values_sql += EscapeSqlString(str_data[row].GetString());
+                        values_sql += '\'';
                     } else {
+                        // Other types (DATE, TIMESTAMP, DECIMAL, UUID, etc.)
+                        Value val = chunk.data[col].GetValue(row);
                         values_sql += '\'';
                         values_sql += EscapeSqlString(val.ToString());
                         values_sql += '\'';
