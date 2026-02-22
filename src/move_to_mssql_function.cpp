@@ -285,7 +285,7 @@ static bool BcpTransferTable(Connection &local_conn, ClientContext &context,
     }
 
     // Invoke BCP
-    string full_table = conn_info.database + "." + schema + "." + mssql_table_name;
+    string full_table = conn_info.database + ".[" + schema + "].[" + mssql_table_name + "]";
     bool success = InvokeBcp(conn_info, full_table, csv_path, fmt_path, error_message, rows_transferred);
 
     // Cleanup
@@ -321,7 +321,7 @@ static bool InsertFallbackTransfer(Connection &local_conn, Connection &mssql_con
     }
 
     idx_t col_count = result->types.size();
-    string insert_prefix = "INSERT INTO " + db_name + "." + schema + ".\"" +
+    string insert_prefix = "INSERT INTO " + db_name + ".\"" + schema + "\".\"" +
                            mssql_table_name + "\" (" + col_list + ") VALUES ";
 
     vector<string> pending_stmts;
@@ -491,8 +491,8 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
             }
 
             string check_create_sql =
-                "IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N''" +
-                EscapeSqlString(target_db) + "'') CREATE DATABASE [" + escaped_db + "]";
+                "IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N'" +
+                EscapeSqlString(target_db) + "') CREATE DATABASE [" + escaped_db + "]";
             string sqlcmd_output, sqlcmd_error;
             if (!ExecuteSqlCmd(validated_conn_info, "master", check_create_sql,
                                sqlcmd_output, sqlcmd_error)) {
@@ -658,9 +658,9 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
 
                 if (has_cols) {
                     info.drop_sql = "DROP TABLE IF EXISTS " + bind_data.secret_name +
-                                    "." + info.target_schema + ".\"" + info.name + "\"";
+                                    ".\"" + info.target_schema + "\".\"" + info.name + "\"";
                     info.create_sql = "CREATE TABLE " + bind_data.secret_name +
-                                      "." + info.target_schema + ".\"" + info.name + "\" (" +
+                                      ".\"" + info.target_schema + "\".\"" + info.name + "\" (" +
                                       create_cols + ")";
                     info.col_list = col_list_tmp;
                     info.col_names = col_names;
@@ -710,9 +710,9 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                                 else escaped_schema += c;
                             }
                             string sqlcmd_sql =
-                                "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N''" +
-                                EscapeSqlString(schema_name) + "'') EXEC(''CREATE SCHEMA [" +
-                                escaped_schema + "]'')";
+                                "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'" +
+                                EscapeSqlString(schema_name) + "') EXEC('CREATE SCHEMA [" +
+                                escaped_schema + "]')";
                             string sqlcmd_output, sqlcmd_error;
                             if (!ExecuteSqlCmd(validated_conn_info, validated_conn_info.database,
                                                sqlcmd_sql, sqlcmd_output, sqlcmd_error)) {
