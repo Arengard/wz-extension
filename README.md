@@ -20,6 +20,10 @@ The `into_wz` function:
 The `move_to_mssql` function:
 - Transfers DuckDB tables to MSSQL Server in bulk
 - Supports transferring all tables, specific tables, or all-except-excluded tables
+- **Auto-creates the target MSSQL database** if it doesn't exist (via `sqlcmd`)
+- **Auto-creates target schemas** in MSSQL as needed
+- **Multi-schema support**: `duckdb_schema='all'` discovers and transfers tables from all DuckDB schemas
+- **Auto-attach source**: `source` parameter accepts a `.db` file path to auto-attach as source
 - DROPs and recreates target tables with auto-mapped column types
 - Uses BCP bulk copy for maximum speed, with batched INSERT VALUES as fallback
 - Reports per-table results (rows transferred, method used, duration, errors)
@@ -38,6 +42,7 @@ The `stps_drop_all` function:
 2. **MSSQL Extension** - Installed from [hugr-lab/mssql-extension](https://github.com/hugr-lab/mssql-extension) (auto-loaded by this extension)
 3. **MSSQL Server** with WZ database containing `tblVorlauf` and `tblPrimanota` tables
 4. **bcp.exe** (optional, recommended) - SQL Server BCP utility for fast bulk transfer. Falls back to batched INSERT VALUES if unavailable.
+5. **sqlcmd** (optional) - SQL Server command-line tool for auto-creating databases. Part of the same [SQL Server tools](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility) package as `bcp`.
 
 ## Installation
 
@@ -203,12 +208,13 @@ Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target ta
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `secret` | VARCHAR | **Yes** | - | Name of the MSSQL connection secret |
+| `source` | VARCHAR | No | - | File path to a DuckDB database file to auto-attach as source (overrides `duckdb_catalog`) |
 | `all_tables` | BOOLEAN | No | `true` | Transfer all tables in DuckDB |
 | `tables` | LIST(VARCHAR) | No | `[]` | Explicit list of table names to transfer (sets `all_tables` to false) |
 | `exclude` | LIST(VARCHAR) | No | `[]` | Tables to exclude when `all_tables` is true |
 | `schema` | VARCHAR | No | `dbo` | Target schema on MSSQL Server (alias: `mssql_schema`) |
-| `mssql_schema` | VARCHAR | No | `dbo` | Alias for `schema` — target schema on MSSQL Server |
-| `duckdb_schema` | VARCHAR | No | `main` | Source schema in DuckDB |
+| `mssql_schema` | VARCHAR | No | `dbo` | Alias for `schema` — target schema on MSSQL Server. When not set with `duckdb_schema='all'`, mirrors each DuckDB schema name. |
+| `duckdb_schema` | VARCHAR | No | `main` | Source schema in DuckDB. Use `'all'` to discover and transfer tables from all schemas. |
 | `duckdb_catalog` | VARCHAR | No | `memory` | Source catalog in DuckDB |
 
 #### Return Value
@@ -256,6 +262,27 @@ SELECT * FROM move_to_mssql(
     duckdb_schema='analytics',
     mssql_schema='dbo',
     tables=['orders', 'customers']
+);
+
+-- Transfer from all DuckDB schemas (mirrors schema names in MSSQL)
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    duckdb_schema='all'
+);
+
+-- Transfer from all schemas into a single MSSQL schema
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    duckdb_schema='all',
+    mssql_schema='staging'
+);
+
+-- Auto-attach a DuckDB database file and transfer its tables
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    source='C:\Users\Ramon\Downloads\my_database.db',
+    duckdb_schema='main',
+    mssql_schema='imported'
 );
 ```
 

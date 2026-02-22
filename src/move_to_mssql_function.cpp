@@ -84,6 +84,8 @@ struct ColumnInfo {
 
 struct TableInfo {
     string name;
+    string source_schema;      // DuckDB schema this table came from
+    string target_schema;      // MSSQL schema to create this table in
     vector<ColumnInfo> columns;
     // Pre-built SQL strings (built in Step 3, used in Step 4)
     // IMPORTANT: All fields below MUST be populated in Step 3 before any MSSQL
@@ -101,6 +103,9 @@ struct MoveToMssqlBindData : public TableFunctionData {
     string duckdb_schema;
     string duckdb_catalog;
     bool all_tables;
+    bool all_duckdb_schemas;      // true when duckdb_schema='all'
+    bool mssql_schema_explicit;   // true when user explicitly set mssql_schema/schema
+    string source_path;           // file path to auto-attach as source DuckDB database
     vector<string> explicit_tables;
     vector<string> exclude_tables;
 
@@ -129,6 +134,8 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
     bind_data->duckdb_schema = "main";
     bind_data->duckdb_catalog = "memory";
     bind_data->all_tables = true;
+    bind_data->all_duckdb_schemas = false;
+    bind_data->mssql_schema_explicit = false;
 
     for (auto &kv : input.named_parameters) {
         auto lower_name = kv.first;
@@ -138,10 +145,17 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
             bind_data->secret_name = kv.second.GetValue<string>();
         } else if (lower_name == "schema" || lower_name == "mssql_schema") {
             bind_data->target_schema = kv.second.GetValue<string>();
+            bind_data->mssql_schema_explicit = true;
         } else if (lower_name == "duckdb_catalog") {
             bind_data->duckdb_catalog = kv.second.GetValue<string>();
         } else if (lower_name == "duckdb_schema") {
-            bind_data->duckdb_schema = kv.second.GetValue<string>();
+            auto val = kv.second.GetValue<string>();
+            string val_lower = val;
+            std::transform(val_lower.begin(), val_lower.end(), val_lower.begin(), ::tolower);
+            if (val_lower == "all") {
+                bind_data->all_duckdb_schemas = true;
+            }
+            bind_data->duckdb_schema = val;
         } else if (lower_name == "all_tables") {
             bind_data->all_tables = kv.second.GetValue<bool>();
         } else if (lower_name == "tables") {
@@ -154,6 +168,8 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
             for (auto &child : children) {
                 bind_data->exclude_tables.push_back(child.GetValue<string>());
             }
+        } else if (lower_name == "source") {
+            bind_data->source_path = kv.second.GetValue<string>();
         }
     }
 
@@ -168,7 +184,7 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
     if (!IsValidSqlIdentifier(bind_data->target_schema)) {
         throw BinderException("move_to_mssql: invalid schema name: " + bind_data->target_schema);
     }
-    if (!IsValidSqlIdentifier(bind_data->duckdb_schema)) {
+    if (!bind_data->all_duckdb_schemas && !IsValidSqlIdentifier(bind_data->duckdb_schema)) {
         throw BinderException("move_to_mssql: invalid duckdb_schema name: " + bind_data->duckdb_schema);
     }
     if (!IsValidSqlIdentifier(bind_data->duckdb_catalog)) {
@@ -363,13 +379,48 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
         auto total_start = std::chrono::high_resolution_clock::now();
 
         auto &db = DatabaseInstance::GetDatabase(context);
+        MssqlConnInfo validated_conn_info;
+
+        // Step 0: Auto-attach source database file if 'source' parameter is set
+        if (!bind_data.source_path.empty()) {
+            std::filesystem::path p(bind_data.source_path);
+            string catalog_name = p.stem().string();
+
+            Connection attach_conn(db);
+            string attach_sql = "ATTACH '" + EscapeSqlString(bind_data.source_path) +
+                                "' AS \"" + catalog_name + "\"";
+            auto attach_result = attach_conn.Query(attach_sql);
+            if (attach_result->HasError()) {
+                // Might already be attached — verify by checking information_schema
+                Connection check_conn(db);
+                auto check_result = check_conn.Query(
+                    "SELECT 1 FROM information_schema.schemata WHERE catalog_name = '" +
+                    EscapeSqlString(catalog_name) + "' LIMIT 1");
+                if (check_result->HasError() ||
+                    check_result->Collection().Count() == 0) {
+                    TableTransferResult err;
+                    err.table_name = "ERROR";
+                    err.rows_transferred = 0;
+                    err.method = "";
+                    err.duration = "00:00:00";
+                    err.success = false;
+                    err.error_message = "Failed to attach database '" +
+                                        bind_data.source_path + "': " +
+                                        attach_result->GetError();
+                    bind_data.results.push_back(std::move(err));
+                    goto output_results;
+                }
+            }
+
+            // Override duckdb_catalog with the derived catalog name
+            bind_data.duckdb_catalog = catalog_name;
+        }
 
         // Step 1: Validate MSSQL secret exists
         {
-            MssqlConnInfo conn_info;
             bool secret_ok = false;
             try {
-                secret_ok = GetMssqlConnInfo(context, bind_data.secret_name, conn_info);
+                secret_ok = GetMssqlConnInfo(context, bind_data.secret_name, validated_conn_info);
             } catch (...) {
                 secret_ok = false;
             }
@@ -387,14 +438,58 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
             }
         }
 
+        // Step 1b: Ensure target database exists (via sqlcmd against master)
+        {
+            string target_db = validated_conn_info.database;
+            // Escape ] as ]] for bracket-delimited identifiers
+            string escaped_db;
+            for (char c : target_db) {
+                if (c == ']') escaped_db += "]]";
+                else escaped_db += c;
+            }
+
+            string check_create_sql =
+                "IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N''" +
+                EscapeSqlString(target_db) + "'') CREATE DATABASE [" + escaped_db + "]";
+            string sqlcmd_output, sqlcmd_error;
+            if (!ExecuteSqlCmd(validated_conn_info, "master", check_create_sql,
+                               sqlcmd_output, sqlcmd_error)) {
+                // Not fatal — database might already exist, or sqlcmd might not be available.
+                // Log as informational result row.
+                TableTransferResult info_row;
+                info_row.table_name = "DB_CREATE";
+                info_row.rows_transferred = 0;
+                info_row.method = "sqlcmd";
+                info_row.duration = "00:00:00";
+                info_row.success = false;
+                info_row.error_message = "Could not auto-create database '" + target_db +
+                                          "' (may already exist): " + sqlcmd_error;
+                bind_data.results.push_back(std::move(info_row));
+            } else {
+                TableTransferResult info_row;
+                info_row.table_name = "DB_CREATE";
+                info_row.rows_transferred = 0;
+                info_row.method = "sqlcmd";
+                info_row.duration = "00:00:00";
+                info_row.success = true;
+                info_row.error_message = "Database '" + target_db + "' ensured";
+                bind_data.results.push_back(std::move(info_row));
+            }
+        }
+
         // Step 2: Discover table names (Connection + Query is safe in Execute)
         // NOTE: Heap-allocate local data structures because MSSQL extension
         // operations via attached databases corrupt the heap. Destructors for
         // stack-allocated objects (vectors, Connection) segfault after MSSQL ops.
         // We intentionally leak these to avoid the crash — a few KB per call.
         {
-            auto *table_names_ptr = new vector<string>();
-            auto &table_names = *table_names_ptr;
+            // Track (source_schema, table_name) pairs
+            struct TableSource {
+                string schema;
+                string name;
+            };
+            auto *table_sources_ptr = new vector<TableSource>();
+            auto &table_sources = *table_sources_ptr;
 
             auto *local_conn_ptr = new Connection(db);
             auto &local_conn = *local_conn_ptr;
@@ -407,28 +502,41 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                     exclude_set.insert(lower_ex);
                 }
 
-                auto result = local_conn.Query(
-                    "SELECT table_name FROM information_schema.tables "
+                string query =
+                    "SELECT table_schema, table_name FROM information_schema.tables "
                     "WHERE table_catalog = '" + EscapeSqlString(bind_data.duckdb_catalog) + "' "
-                    "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
-                    "AND table_type = 'BASE TABLE' ORDER BY table_name");
+                    "AND table_type = 'BASE TABLE' ";
+                if (bind_data.all_duckdb_schemas) {
+                    // Skip system schemas when discovering all schemas
+                    query += "AND table_schema NOT IN ('information_schema', 'pg_catalog') ";
+                } else {
+                    query += "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' ";
+                }
+                query += "ORDER BY table_schema, table_name";
+
+                auto result = local_conn.Query(query);
                 if (!result->HasError()) {
                     for (auto &chunk : result->Collection().Chunks()) {
                         for (idx_t row = 0; row < chunk.size(); row++) {
-                            string tname = chunk.data[0].GetValue(row).ToString();
+                            string tschema = chunk.data[0].GetValue(row).ToString();
+                            string tname = chunk.data[1].GetValue(row).ToString();
                             string tname_lower = tname;
                             std::transform(tname_lower.begin(), tname_lower.end(), tname_lower.begin(), ::tolower);
                             if (exclude_set.find(tname_lower) == exclude_set.end()) {
-                                table_names.push_back(tname);
+                                table_sources.push_back({tschema, tname});
                             }
                         }
                     }
                 }
             } else {
-                table_names = bind_data.explicit_tables;
+                // Explicit table list — use duckdb_schema (or 'main' if 'all')
+                string src_schema = bind_data.all_duckdb_schemas ? "main" : bind_data.duckdb_schema;
+                for (auto &t : bind_data.explicit_tables) {
+                    table_sources.push_back({src_schema, t});
+                }
             }
 
-            if (table_names.empty()) {
+            if (table_sources.empty()) {
                 TableTransferResult err;
                 err.table_name = "ERROR";
                 err.rows_transferred = 0;
@@ -444,19 +552,26 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
             // Heap-allocate to avoid destructor crash (see note at Step 2)
             auto *tables_ptr = new vector<TableInfo>();
             auto &tables_to_transfer = *tables_ptr;
-            for (auto &tname : table_names) {
+            for (auto &ts : table_sources) {
                 TableInfo info;
-                info.name = tname;
+                info.name = ts.name;
+                info.source_schema = ts.schema;
+                // Determine target MSSQL schema:
+                // - If user explicitly set mssql_schema, use that for all tables
+                // - Otherwise, mirror the DuckDB schema name
+                info.target_schema = bind_data.mssql_schema_explicit
+                                         ? bind_data.target_schema
+                                         : ts.schema;
 
                 auto col_result = local_conn.Query(
                     "SELECT column_name, data_type FROM information_schema.columns "
                     "WHERE table_catalog = '" + EscapeSqlString(bind_data.duckdb_catalog) + "' "
-                    "AND table_schema = '" + EscapeSqlString(bind_data.duckdb_schema) + "' "
-                    "AND table_name = '" + EscapeSqlString(tname) + "' "
+                    "AND table_schema = '" + EscapeSqlString(ts.schema) + "' "
+                    "AND table_name = '" + EscapeSqlString(ts.name) + "' "
                     "ORDER BY ordinal_position");
                 if (col_result->HasError()) {
                     TableTransferResult err;
-                    err.table_name = tname;
+                    err.table_name = ts.name;
                     err.rows_transferred = 0;
                     err.method = "";
                     err.duration = "00:00:00";
@@ -492,14 +607,78 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
 
                 if (has_cols) {
                     info.drop_sql = "DROP TABLE IF EXISTS " + bind_data.secret_name +
-                                    "." + bind_data.target_schema + ".\"" + info.name + "\"";
+                                    "." + info.target_schema + ".\"" + info.name + "\"";
                     info.create_sql = "CREATE TABLE " + bind_data.secret_name +
-                                      "." + bind_data.target_schema + ".\"" + info.name + "\" (" +
+                                      "." + info.target_schema + ".\"" + info.name + "\" (" +
                                       create_cols + ")";
                     info.col_list = col_list_tmp;
                     info.col_names = col_names;
 
                     tables_to_transfer.push_back(std::move(info));
+                }
+            }
+
+            // Step 3b: Ensure all target schemas exist in MSSQL
+            {
+                set<string> needed_schemas;
+                for (auto &t : tables_to_transfer) {
+                    if (t.target_schema != "dbo") {
+                        needed_schemas.insert(t.target_schema);
+                    }
+                }
+
+                for (auto &schema_name : needed_schemas) {
+                    // Check if schema exists
+                    Connection schema_conn(db);
+                    string schema_check_sql =
+                        "SELECT * FROM mssql_scan('" + EscapeSqlString(bind_data.secret_name) +
+                        "', $$SELECT 1 AS exists_flag FROM sys.schemas WHERE name = '" +
+                        EscapeSqlString(schema_name) + "'$$)";
+                    auto schema_result = schema_conn.Query(schema_check_sql);
+
+                    bool schema_exists = false;
+                    if (!schema_result->HasError()) {
+                        for (auto &chunk : schema_result->Collection().Chunks()) {
+                            if (chunk.size() > 0) schema_exists = true;
+                        }
+                    }
+
+                    if (!schema_exists) {
+                        // Try creating via mssql_scan first
+                        Connection create_conn(db);
+                        string create_sql =
+                            "SELECT * FROM mssql_scan('" + EscapeSqlString(bind_data.secret_name) +
+                            "', $$EXEC('CREATE SCHEMA [" + EscapeSqlString(schema_name) +
+                            "]'); SELECT 1 AS ok$$)";
+                        auto create_result = create_conn.Query(create_sql);
+                        if (create_result->HasError()) {
+                            // Fallback: try via sqlcmd
+                            string escaped_schema;
+                            for (char c : schema_name) {
+                                if (c == ']') escaped_schema += "]]";
+                                else escaped_schema += c;
+                            }
+                            string sqlcmd_sql =
+                                "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N''" +
+                                EscapeSqlString(schema_name) + "'') EXEC(''CREATE SCHEMA [" +
+                                escaped_schema + "]'')";
+                            string sqlcmd_output, sqlcmd_error;
+                            if (!ExecuteSqlCmd(validated_conn_info, validated_conn_info.database,
+                                               sqlcmd_sql, sqlcmd_output, sqlcmd_error)) {
+                                TableTransferResult err;
+                                err.table_name = "SCHEMA_CREATE";
+                                err.rows_transferred = 0;
+                                err.method = "";
+                                err.duration = "00:00:00";
+                                err.success = false;
+                                err.error_message = "Failed to create MSSQL schema '" +
+                                                    schema_name + "': " + create_result->GetError() +
+                                                    " | sqlcmd: " + sqlcmd_error;
+                                bind_data.results.push_back(std::move(err));
+                                goto output_results;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -542,9 +721,9 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                         int64_t rows = 0;
                         string bcp_error;
                         bool bcp_ok = BcpTransferTable(local_conn, context, bind_data.secret_name,
-                                                        table.name, bind_data.target_schema, table.name,
+                                                        table.name, table.target_schema, table.name,
                                                         table.col_names, table.col_list,
-                                                        bind_data.duckdb_catalog, bind_data.duckdb_schema,
+                                                        bind_data.duckdb_catalog, table.source_schema,
                                                         bcp_error, rows);
 
                         if (bcp_ok) {
@@ -559,10 +738,10 @@ static void MoveToMssqlExecute(ClientContext &context, TableFunctionInput &data_
                             int64_t insert_rows = 0;
                             bool insert_ok = InsertFallbackTransfer(read_conn, write_conn,
                                                                      table.name, bind_data.secret_name,
-                                                                     bind_data.target_schema,
+                                                                     table.target_schema,
                                                                      table.name,
                                                                      table.col_list,
-                                                                     bind_data.duckdb_catalog, bind_data.duckdb_schema,
+                                                                     bind_data.duckdb_catalog, table.source_schema,
                                                                      insert_error, insert_rows);
                             if (insert_ok) {
                                 result.rows_transferred = insert_rows;
@@ -643,6 +822,7 @@ void RegisterMoveToMssqlFunction(DatabaseInstance &db) {
     func.named_parameters["mssql_schema"] = LogicalType::VARCHAR;
     func.named_parameters["duckdb_schema"] = LogicalType::VARCHAR;
     func.named_parameters["duckdb_catalog"] = LogicalType::VARCHAR;
+    func.named_parameters["source"] = LogicalType::VARCHAR;
 
     Connection con(db);
     con.BeginTransaction();

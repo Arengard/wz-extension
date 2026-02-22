@@ -252,4 +252,54 @@ inline bool InvokeBcp(const MssqlConnInfo &info, const string &full_table_name,
     return true;
 }
 
+// ============================================================================
+// sqlcmd invocation
+// ============================================================================
+
+// Execute a T-SQL statement via sqlcmd against a specific database.
+// Uses the same server/credentials as the MssqlConnInfo.
+// Returns true on success. On failure, error_message is populated.
+inline bool ExecuteSqlCmd(const MssqlConnInfo &info, const string &database,
+                          const string &sql, string &output, string &error_message) {
+    output.clear();
+
+    // Build sqlcmd command
+    string cmd = "sqlcmd -S " + info.server + " -d " + database;
+    if (info.trusted) {
+        cmd += " -E";
+    } else {
+        cmd += " -U " + info.user + " -P " + info.password;
+    }
+    cmd += " -C -b -h -1 -Q \"" + sql + "\" 2>&1";
+
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) {
+        error_message = "Failed to execute sqlcmd command";
+        return false;
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    int exit_code = _pclose(pipe);
+#else
+    int exit_code = pclose(pipe);
+#endif
+
+    if (exit_code != 0) {
+        if (output.size() > 500) output = output.substr(0, 500) + "...";
+        error_message = "sqlcmd failed (exit " + std::to_string(exit_code) + "): " + output;
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace duckdb
