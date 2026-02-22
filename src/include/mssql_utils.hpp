@@ -207,6 +207,8 @@ inline bool InvokeBcp(const MssqlConnInfo &info, const string &full_table_name,
     cmd += " 2>&1";
 
     // Execute and capture output
+    // Flush all stdio before spawning child process to prevent buffer corruption
+    fflush(stdout); fflush(stderr);
     string output;
 #ifdef _WIN32
     FILE *pipe = _popen(cmd.c_str(), "r");
@@ -228,6 +230,7 @@ inline bool InvokeBcp(const MssqlConnInfo &info, const string &full_table_name,
 #else
     int exit_code = pclose(pipe);
 #endif
+    fflush(stdout); fflush(stderr);
 
     if (exit_code != 0) {
         // Truncate output for error message
@@ -236,8 +239,9 @@ inline bool InvokeBcp(const MssqlConnInfo &info, const string &full_table_name,
         return false;
     }
 
-    // Parse "N rows copied" from bcp output
+    // Parse "N rows copied" (English) or "N Zeilen kopiert" (German) from bcp output
     auto pos = output.find("rows copied");
+    if (pos == string::npos) pos = output.find("Zeilen kopiert");
     if (pos != string::npos) {
         // Walk backwards from "rows copied" to find the number
         auto num_end = pos;
@@ -272,6 +276,7 @@ inline bool ExecuteSqlCmd(const MssqlConnInfo &info, const string &database,
     }
     cmd += " -C -b -h -1 -Q \"" + sql + "\" 2>&1";
 
+    fflush(stdout); fflush(stderr);
 #ifdef _WIN32
     FILE *pipe = _popen(cmd.c_str(), "r");
 #else
@@ -292,6 +297,58 @@ inline bool ExecuteSqlCmd(const MssqlConnInfo &info, const string &database,
 #else
     int exit_code = pclose(pipe);
 #endif
+    fflush(stdout); fflush(stderr);
+
+    if (exit_code != 0) {
+        if (output.size() > 500) output = output.substr(0, 500) + "...";
+        error_message = "sqlcmd failed (exit " + std::to_string(exit_code) + "): " + output;
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// sqlcmd file-based invocation
+// ============================================================================
+
+// Execute a T-SQL script file via sqlcmd using -i flag.
+// Used for large SQL batches that exceed -Q command-line limits.
+inline bool ExecuteSqlCmdFile(const MssqlConnInfo &info, const string &database,
+                               const string &sql_file_path, string &output,
+                               string &error_message) {
+    output.clear();
+
+    string cmd = "sqlcmd -S " + info.server + " -d " + database;
+    if (info.trusted) {
+        cmd += " -E";
+    } else {
+        cmd += " -U " + info.user + " -P " + info.password;
+    }
+    cmd += " -C -b -i \"" + sql_file_path + "\" 2>&1";
+
+    fflush(stdout); fflush(stderr);
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) {
+        error_message = "Failed to execute sqlcmd command";
+        return false;
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    int exit_code = _pclose(pipe);
+#else
+    int exit_code = pclose(pipe);
+#endif
+    fflush(stdout); fflush(stderr);
 
     if (exit_code != 0) {
         if (output.size() > 500) output = output.substr(0, 500) + "...";
