@@ -949,6 +949,47 @@ static bool VorlaufExists(Connection &conn,
 }
 
 // ============================================================================
+// Find an existing tblVorlauf record whose date range covers the given dates.
+// Returns true on success (SQL OK), false on SQL error.
+// Sets existing_vorlauf_id to the found UUID, or empty string if none.
+// ============================================================================
+
+static bool FindExistingVorlauf(Connection &conn,
+                                const string &db_name,
+                                const string &verfahren_id,
+                                const string &date_from,
+                                const string &date_to,
+                                string &existing_vorlauf_id,
+                                string &error_message) {
+    existing_vorlauf_id.clear();
+
+    string sql = "SELECT TOP 1 CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID"
+                 " FROM " + db_name + ".dbo.tblVorlauf"
+                 " WHERE guiVerfahrenID = '" + EscapeSqlString(verfahren_id) + "'"
+                 " AND dtmVorlaufDatumVon <= '" + EscapeSqlString(date_from) + " 00:00:00'"
+                 " AND dtmVorlaufDatumBis >= '" + EscapeSqlString(date_to) + " 00:00:00'"
+                 " ORDER BY dtmAngelegt DESC";
+
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+        error_message = "Failed to query existing tblVorlauf: " + result->GetError();
+        return false;
+    }
+
+    auto materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+    if (materialized->Collection().Count() > 0) {
+        for (auto &chunk : materialized->Collection().Chunks()) {
+            if (chunk.size() > 0) {
+                existing_vorlauf_id = chunk.data[0].GetValue(0).ToString();
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Insert a single tblVorlauf record via the transaction connection.
 // Returns true on success, sets error_message on failure.
 // ============================================================================
