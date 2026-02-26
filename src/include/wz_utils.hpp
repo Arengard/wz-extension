@@ -118,7 +118,7 @@ inline idx_t FindColumnWithAliases(const vector<string> &source_columns, const s
 // ============================================================================
 
 // Get the current timestamp formatted for MSSQL with centisecond precision.
-// Format: "YYYY-MM-DD HH:MM:SS.cc"
+// Format: "YYYY-MM-DDTHH:MM:SS.cc"  (ISO 8601 T separator — locale-safe on SQL Server)
 inline string GetCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -133,7 +133,7 @@ inline string GetCurrentTimestamp() {
 #endif
 
     char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &time_info);
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &time_info);
 
     char result[64];
     snprintf(result, sizeof(result), "%s.%02d", buffer, static_cast<int>(ms.count() / 10));
@@ -175,28 +175,30 @@ inline string GetCurrentMonthStart() {
 }
 
 // ============================================================================
+// Date format helpers
+// ============================================================================
+
+// Convert "YYYY-MM-DD" to "YYYYMMDD" (no separators).
+// SQL Server always parses YYYYMMDD as an unambiguous date regardless of
+// server language/locale — avoids the DuckDB-MSSQL bridge injecting CONVERT().
+inline string CompactDateYYYYMMDD(const string &d) {
+    if (d.length() >= 10) {
+        return d.substr(0, 4) + d.substr(5, 2) + d.substr(8, 2);
+    }
+    return d;
+}
+
+// ============================================================================
 // Vorlauf helpers
 // ============================================================================
 
 // Derive Vorlauf description from a date range.
-// Produces a string like "Vorlauf 01/2024-03/2024".
+// Produces a string like "Vorlauf 2024-01-01 - 2024-03-31".
 inline string DeriveVorlaufBezeichnung(const string &date_from, const string &date_to) {
-    int year_from = 0, month_from = 0;
-    if (date_from.length() >= 7) {
-        year_from = std::stoi(date_from.substr(0, 4));
-        month_from = std::stoi(date_from.substr(5, 2));
-    }
-
-    int year_to = 0, month_to = 0;
-    if (date_to.length() >= 7) {
-        year_to = std::stoi(date_to.substr(0, 4));
-        month_to = std::stoi(date_to.substr(5, 2));
-    }
-
-    char buffer[128];
-    snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d-%02d/%d",
-             month_from, year_from, month_to, year_to);
-    return string(buffer);
+    // Use YYYY-MM-DD date format, consistent with BuildBezeichnungFromPrefix.
+    string from = date_from.length() >= 10 ? date_from.substr(0, 10) : date_from;
+    string to   = date_to.length()   >= 10 ? date_to.substr(0, 10)   : date_to;
+    return "Vorlauf " + from + " - " + to;
 }
 
 // Extract "YYYY-MM" from a date string (first 7 chars). Returns "" if too short.
@@ -226,17 +228,15 @@ inline string GetLastDayOfMonth(const string &year_month) {
     return string(buffer);
 }
 
-// Derive single-month Vorlauf description: "Vorlauf MM/YYYY".
+// Derive single-month Vorlauf description: "Vorlauf YYYY-MM-01 - YYYY-MM-DD".
+// Uses YYYY-MM-DD format consistent with BuildBezeichnungFromPrefix.
 inline string DeriveMonthVorlaufBezeichnung(const string &year_month) {
     if (year_month.length() < 7) {
         return "Vorlauf";
     }
-    int year = std::stoi(year_month.substr(0, 4));
-    int month = std::stoi(year_month.substr(5, 2));
-
-    char buffer[64];
-    snprintf(buffer, sizeof(buffer), "Vorlauf %02d/%d", month, year);
-    return string(buffer);
+    string date_from = year_month + "-01";
+    string date_to   = GetLastDayOfMonth(year_month);
+    return "Vorlauf " + date_from + " - " + date_to;
 }
 
 } // namespace duckdb

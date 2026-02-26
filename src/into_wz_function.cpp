@@ -650,15 +650,15 @@ static string BuildVorlaufInsertSQL(const string &db_name,
     sql << ") VALUES (";
     sql << "0, ";  // lngTimestamp
     sql << "'" << EscapeSqlString(str_angelegt) << "', ";  // strAngelegt
-    sql << "'" << timestamp << "', ";  // dtmAngelegt
+    sql << "'" << EscapeSqlString(timestamp) << "', ";  // dtmAngelegt
     sql << "NULL, ";  // strGeaendert
     sql << "NULL, ";  // dtmGeaendert
     sql << "'" << EscapeSqlString(vorlauf_id) << "', ";  // guiVorlaufID
     sql << "'" << EscapeSqlString(verfahren_id) << "', ";  // guiVerfahrenID
     sql << konten_rahmen_id << ", ";  // lngKanzleiKontenRahmenID
     sql << "1, ";  // lngStatus
-    sql << "'" << EscapeSqlString(date_to) << " 00:00:00', ";  // dtmVorlaufDatumBis
-    sql << "'" << EscapeSqlString(date_from) << " 00:00:00', ";  // dtmVorlaufDatumVon
+    sql << "'" << CompactDateYYYYMMDD(date_to) << "', ";  // dtmVorlaufDatumBis
+    sql << "'" << CompactDateYYYYMMDD(date_from) << "', ";  // dtmVorlaufDatumVon
     sql << "NULL, ";  // lngVorlaufNr
     sql << "'" << EscapeSqlString(bezeichnung) << "', ";  // strBezeichnung
     sql << "NULL, ";  // dtmDatevExport
@@ -968,8 +968,8 @@ static bool FindExistingVorlauf(Connection &conn,
     string sql = "SELECT CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID"
                  " FROM " + db_name + ".dbo.tblVorlauf"
                  " WHERE guiVerfahrenID = '" + EscapeSqlString(verfahren_id) + "'"
-                 " AND dtmVorlaufDatumVon <= '" + EscapeSqlString(date_from) + " 00:00:00'"
-                 " AND dtmVorlaufDatumBis >= '" + EscapeSqlString(date_to) + " 00:00:00'"
+                 " AND dtmVorlaufDatumVon <= '" + CompactDateYYYYMMDD(date_from) + "'"
+                 " AND dtmVorlaufDatumBis >= '" + CompactDateYYYYMMDD(date_to) + "'"
                  " ORDER BY dtmAngelegt DESC";
 
     auto result = conn.Query(sql);
@@ -1039,9 +1039,9 @@ static bool UpdateVorlauf(Connection &txn_conn,
     std::ostringstream sql;
     sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET ";
     sql << "strBezeichnung = '" << EscapeSqlString(bezeichnung) << "', ";
-    sql << "dtmVorlaufDatumBis = '" << EscapeSqlString(date_to) << " 00:00:00', ";
+    sql << "dtmVorlaufDatumBis = '" << CompactDateYYYYMMDD(date_to) << "', ";
     sql << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', ";
-    sql << "dtmGeaendert = '" << timestamp << "' ";
+    sql << "dtmGeaendert = '" << EscapeSqlString(timestamp) << "' ";
     sql << "WHERE guiVorlaufID = '" << EscapeSqlString(vorlauf_id) << "'";
 
     if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
@@ -1305,6 +1305,18 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
         return true;
     };
 
+    // Pre-compute which columns are datetime (dtm-prefixed) vs integer vs plain string.
+    // This avoids locale-dependent datetime conversion errors on German SQL Server.
+    // Columns not in PRIMANOTA_COLUMN_LIST (e.g. year_month filter) are skipped via col_count.
+    vector<bool> is_datetime_col(col_count, false);
+    for (idx_t col = 0; col < col_count; col++) {
+        const auto &col_name = staging_result->names[col];
+        if (col_name.size() >= 3 &&
+            col_name[0] == 'd' && col_name[1] == 't' && col_name[2] == 'm') {
+            is_datetime_col[col] = true;
+        }
+    }
+
     for (auto &chunk : staging_result->Collection().Chunks()) {
         idx_t row_count = chunk.size();
         for (idx_t row = 0; row < row_count; row++) {
@@ -1322,6 +1334,16 @@ static bool BulkTransferPrimanota(Connection &txn_conn,
                     if (type == LogicalType::INTEGER || type == LogicalType::BIGINT ||
                         type == LogicalType::SMALLINT || type == LogicalType::TINYINT) {
                         values_sql += val.ToString();
+                    } else if (is_datetime_col[col]) {
+                        // Use ISO 8601 T-separator format (YYYY-MM-DDTHH:MM:SS).
+                        // SQL Server always parses this regardless of server language/locale.
+                        // DuckDB passes it through as a plain string literal.
+                        string dt = val.ToString();
+                        // Replace the space between date and time with 'T' if present
+                        if (dt.length() >= 11 && dt[10] == ' ') dt[10] = 'T';
+                        values_sql += '\'';
+                        values_sql += EscapeSqlString(dt);
+                        values_sql += '\'';
                     } else {
                         values_sql += '\'';
                         values_sql += EscapeSqlString(val.ToString());
@@ -1594,13 +1616,13 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
             if (j > 0) sql << ", ";
             sql << "(0, "
                 << "'" << EscapeSqlString(str_angelegt) << "', "
-                << "'" << timestamp << "', "
+                << "'" << EscapeSqlString(timestamp) << "', "
                 << "NULL, NULL, "
                 << "'" << EscapeSqlString(mi.vorlauf_id) << "', "
                 << "'" << EscapeSqlString(gui_verfahren_id) << "', "
                 << konten_rahmen_id << ", 1, "
-                << "'" << EscapeSqlString(mi.date_to) << " 00:00:00', "
-                << "'" << EscapeSqlString(mi.date_from) << " 00:00:00', "
+                << "'" << CompactDateYYYYMMDD(mi.date_to) << "', "
+                << "'" << CompactDateYYYYMMDD(mi.date_from) << "', "
                 << "NULL, "
                 << "'" << EscapeSqlString(mi.bezeichnung) << "', "
                 << "NULL, 0)";
@@ -1620,9 +1642,9 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
             if (j > 0) sql << "; ";
             sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET "
                 << "strBezeichnung = '" << EscapeSqlString(mi.bezeichnung) << "', "
-                << "dtmVorlaufDatumBis = '" << EscapeSqlString(mi.date_to) << " 00:00:00', "
+                << "dtmVorlaufDatumBis = '" << CompactDateYYYYMMDD(mi.date_to) << "', "
                 << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', "
-                << "dtmGeaendert = '" << timestamp << "' "
+                << "dtmGeaendert = '" << EscapeSqlString(timestamp) << "' "
                 << "WHERE guiVorlaufID = '" << EscapeSqlString(mi.vorlauf_id) << "'";
         }
 
