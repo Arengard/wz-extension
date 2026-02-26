@@ -1049,8 +1049,8 @@ static bool PopulateStagingTable(Connection &staging_conn,
             const string &primanota_id = primanota_ids[i];
 
             const Value &beleg_datum_val = getValue(col_idx.col_beleg_datum);
-            string beleg_datum = beleg_datum_val.IsNull() ? date_fallback : beleg_datum_val.ToString();
-            if (beleg_datum.length() > 10) beleg_datum = beleg_datum.substr(0, 10);
+            string beleg_datum = beleg_datum_val.IsNull() ? date_fallback
+                : NormalizeDateToISO(beleg_datum_val.ToString());
             beleg_datum += " 00:00:00";
 
             bool is_soll = ParseSollHaben(getValue(col_idx.col_ysn_soll));
@@ -2499,8 +2499,8 @@ static bool BatchPopulateStagingTable(Connection &staging_conn,
             const string &primanota_id = primanota_ids[i];
 
             const Value &beleg_datum_val = getValue(col_idx.col_beleg_datum);
-            string beleg_datum = beleg_datum_val.IsNull() ? date_fallback : beleg_datum_val.ToString();
-            if (beleg_datum.length() > 10) beleg_datum = beleg_datum.substr(0, 10);
+            string beleg_datum = beleg_datum_val.IsNull() ? date_fallback
+                : NormalizeDateToISO(beleg_datum_val.ToString());
             beleg_datum += " 00:00:00";
 
             bool is_soll = ParseSollHaben(getValue(col_idx.col_ysn_soll));
