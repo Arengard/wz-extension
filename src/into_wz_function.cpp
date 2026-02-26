@@ -247,6 +247,7 @@ struct VerfahrenGroup {
     string date_from;
     string date_to;
     string bezeichnung;
+    string vorlauf_datum_bis;  // actual dtmVorlaufDatumBis from DB (for FK match when reusing)
     vector<string> primanota_ids;
     bool reuse_existing = false;
 };
@@ -302,6 +303,7 @@ struct IntoWzGlobalState : public GlobalTableFunctionState {
     // Single-vorlauf state
     string vorlauf_id;
     string date_from, date_to, bezeichnung;
+    string vorlauf_datum_bis;  // actual dtmVorlaufDatumBis from DB (for FK match when reusing)
     vector<string> primanota_ids;
     bool vorlauf_id_from_source;
     bool skip_vorlauf_insert;
@@ -954,6 +956,8 @@ static bool VorlaufExists(Connection &conn,
 // Find an existing tblVorlauf record whose date range covers the given dates.
 // Returns true on success (SQL OK), false on SQL error.
 // Sets existing_vorlauf_id to the found UUID, or empty string if none.
+// Also sets existing_datum_bis to the record's dtmVorlaufDatumBis (needed for
+// FK_tblPrimanota_tblVorlauf which includes dtmVorlaufDatumBis as part of the key).
 // ============================================================================
 
 static bool FindExistingVorlauf(Connection &conn,
@@ -962,14 +966,21 @@ static bool FindExistingVorlauf(Connection &conn,
                                 const string &date_from,
                                 const string &date_to,
                                 string &existing_vorlauf_id,
+                                string &existing_datum_bis,
                                 string &error_message) {
     existing_vorlauf_id.clear();
+    existing_datum_bis.clear();
 
-    string sql = "SELECT CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID"
+    // Cast datetime columns to VARCHAR for comparison to avoid DuckDB-MSSQL bridge
+    // locale issues: the bridge formats timestamps as YYYY-MM-DD which German SQL Server
+    // interprets as YYYY-DD-MM, causing "out of range" errors. VARCHAR comparison with
+    // ISO-formatted strings is lexicographically correct and locale-independent.
+    string sql = "SELECT CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID,"
+                 " CAST(dtmVorlaufDatumBis AS VARCHAR(30)) AS dtmVorlaufDatumBis"
                  " FROM " + db_name + ".dbo.tblVorlauf"
                  " WHERE guiVerfahrenID = '" + EscapeSqlString(verfahren_id) + "'"
-                 " AND dtmVorlaufDatumVon <= '" + CompactDateYYYYMMDD(date_from) + "'"
-                 " AND dtmVorlaufDatumBis >= '" + CompactDateYYYYMMDD(date_to) + "'"
+                 " AND CAST(dtmVorlaufDatumVon AS VARCHAR(30)) <= '" + EscapeSqlString(date_from) + " 00:00:00'"
+                 " AND CAST(dtmVorlaufDatumBis AS VARCHAR(30)) >= '" + EscapeSqlString(date_to) + " 00:00:00'"
                  " ORDER BY dtmAngelegt DESC";
 
     auto result = conn.Query(sql);
@@ -983,6 +994,7 @@ static bool FindExistingVorlauf(Connection &conn,
         for (auto &chunk : materialized->Collection().Chunks()) {
             if (chunk.size() > 0) {
                 existing_vorlauf_id = chunk.data[0].GetValue(0).ToString();
+                existing_datum_bis = chunk.data[1].GetValue(0).ToString();
                 break;
             }
         }
@@ -1022,35 +1034,8 @@ static bool InsertVorlauf(Connection &txn_conn,
     return true;
 }
 
-// ============================================================================
-// Update an existing tblVorlauf record (strBezeichnung and dtmVorlaufDatumBis).
-// Returns true on success, sets error_message on failure.
-// ============================================================================
-
-static bool UpdateVorlauf(Connection &txn_conn,
-                          const string &db_name,
-                          const string &vorlauf_id,
-                          const string &date_to,
-                          const string &bezeichnung,
-                          const string &str_angelegt,
-                          string &error_message) {
-    string timestamp = GetCurrentTimestamp();
-
-    std::ostringstream sql;
-    sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET ";
-    sql << "strBezeichnung = '" << EscapeSqlString(bezeichnung) << "', ";
-    sql << "dtmVorlaufDatumBis = '" << CompactDateYYYYMMDD(date_to) << "', ";
-    sql << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', ";
-    sql << "dtmGeaendert = '" << EscapeSqlString(timestamp) << "' ";
-    sql << "WHERE guiVorlaufID = '" << EscapeSqlString(vorlauf_id) << "'";
-
-    if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
-        error_message = "Failed to update tblVorlauf: " + error_message;
-        return false;
-    }
-
-    return true;
-}
+// Note: UpdateVorlauf was removed — when an existing Vorlauf covers the date range,
+// we reuse it as-is without modification.
 
 // ============================================================================
 // Populate local staging table with Primanota rows using DuckDB Appender.
@@ -1634,25 +1619,7 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
         }
     }
 
-    // Step 3: Batched UPDATE statements for existing ones
-    if (!update_indices.empty()) {
-        std::ostringstream sql;
-        for (size_t j = 0; j < update_indices.size(); j++) {
-            auto &mi = months[update_indices[j]];
-            if (j > 0) sql << "; ";
-            sql << "UPDATE " << db_name << ".dbo.tblVorlauf SET "
-                << "strBezeichnung = '" << EscapeSqlString(mi.bezeichnung) << "', "
-                << "dtmVorlaufDatumBis = '" << CompactDateYYYYMMDD(mi.date_to) << "', "
-                << "strGeaendert = '" << EscapeSqlString(str_angelegt) << "', "
-                << "dtmGeaendert = '" << EscapeSqlString(timestamp) << "' "
-                << "WHERE guiVorlaufID = '" << EscapeSqlString(mi.vorlauf_id) << "'";
-        }
-
-        if (!ExecuteMssqlStatement(txn_conn, sql.str(), error_message)) {
-            error_message = "Failed to batch-update Vorlauf records: " + error_message;
-            return false;
-        }
-    }
+    // Step 3: Existing Vorlauf records are reused as-is (no UPDATE needed).
 
     auto batch_end = std::chrono::high_resolution_clock::now();
     double total_dur = std::chrono::duration<double>(batch_end - batch_start).count();
@@ -2093,7 +2060,10 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                 }
             }
         } else {
-            string vorlauf_datum_bis = state.date_to + " 00:00:00";
+            // Use actual dtmVorlaufDatumBis from DB when reusing (FK requires exact match).
+            string vorlauf_datum_bis = state.skip_vorlauf_insert && !state.vorlauf_datum_bis.empty()
+                ? state.vorlauf_datum_bis
+                : state.date_to + " 00:00:00";
             if (!PopulateStagingTable(*state.staging_conn, bind_data,
                                        nullptr, state.primanota_ids,
                                        state.vorlauf_id, bind_data.gui_verfahren_id,
@@ -2182,16 +2152,17 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
 
             // Try to reuse an existing Vorlauf (query-first lookup)
             if (state.try_vorlauf_reuse) {
-                string existing_id;
+                string existing_id, existing_bis;
                 if (!FindExistingVorlauf(*state.txn_conn, bind_data.secret_name,
                                           bind_data.gui_verfahren_id,
                                           state.date_from, state.date_to,
-                                          existing_id, error_msg)) {
+                                          existing_id, existing_bis, error_msg)) {
                     CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg);
                     return;
                 }
                 if (!existing_id.empty()) {
                     state.vorlauf_id = existing_id;
+                    state.vorlauf_datum_bis = existing_bis;
                     state.skip_vorlauf_insert = true;
                 } else {
                     // No reusable Vorlauf found — generate new UUID
@@ -2220,14 +2191,8 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                 double vorlauf_dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
                 AddSuccessResult(bind_data, "tblVorlauf", 1, state.vorlauf_id, vorlauf_dur);
             } else {
-                auto vorlauf_start = std::chrono::high_resolution_clock::now();
-                if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name, state.vorlauf_id, state.date_to, state.bezeichnung, bind_data.str_angelegt, error_msg)) {
-                    CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
-                    return;
-                }
-                auto vorlauf_end = std::chrono::high_resolution_clock::now();
-                double vorlauf_dur = std::chrono::duration<double>(vorlauf_end - vorlauf_start).count();
-                AddSuccessResult(bind_data, "tblVorlauf (updated)", 0, state.vorlauf_id, vorlauf_dur);
+                // Existing Vorlauf covers our date range — reuse as-is, no update needed.
+                AddSuccessResult(bind_data, "tblVorlauf (reused)", 0, state.vorlauf_id, 0.0);
             }
             // txn_conn stays open — TRANSFER_PRIMANOTA will COMMIT
         }
@@ -2966,13 +2931,13 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
 
         // 3. Find existing Vorlauf or generate new UUID
         {
-            string existing_id;
+            string existing_id, existing_bis;
             if (bind_data.generate_vorlauf_id) {
                 // Try reuse first
                 if (!FindExistingVorlauf(*state.txn_conn, bind_data.secret_name,
                                           group.gui_verfahren_id,
                                           group.date_from, group.date_to,
-                                          existing_id, error_msg)) {
+                                          existing_id, existing_bis, error_msg)) {
                     BatchCleanupAndError(state, bind_data, output, "ERROR",
                         "Failed to find existing Vorlauf for group " + group.gui_verfahren_id + ": " + error_msg);
                     return;
@@ -2981,6 +2946,7 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
 
             if (!existing_id.empty()) {
                 group.vorlauf_id = existing_id;
+                group.vorlauf_datum_bis = existing_bis;
                 group.reuse_existing = true;
             } else if (bind_data.generate_vorlauf_id) {
                 // No reusable Vorlauf — generate new UUID
@@ -3026,16 +2992,8 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
                 std::chrono::high_resolution_clock::now() - group_start).count();
 
             if (group.reuse_existing) {
-                // Reusing existing Vorlauf — update bezeichnung
-                if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name,
-                                    group.vorlauf_id, group.date_to,
-                                    group.bezeichnung, bind_data.str_angelegt, error_msg)) {
-                    BatchCleanupAndError(state, bind_data, output, "ERROR", error_msg);
-                    return;
-                }
-                double dur = std::chrono::duration<double>(
-                    std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
-                BatchAddSuccessResult(bind_data, "tblVorlauf (reused)", 0, group.vorlauf_id, dur);
+                // Existing Vorlauf covers our date range — reuse as-is, no update needed.
+                BatchAddSuccessResult(bind_data, "tblVorlauf (reused)", 0, group.vorlauf_id, 0.0);
             } else {
                 bool exists = false;
                 if (!VorlaufExists(*state.txn_conn, bind_data.secret_name, group.vorlauf_id, exists, error_msg)) {
@@ -3044,15 +3002,8 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
                 }
 
                 if (exists) {
-                    if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name,
-                                        group.vorlauf_id, group.date_to,
-                                        group.bezeichnung, bind_data.str_angelegt, error_msg)) {
-                        BatchCleanupAndError(state, bind_data, output, "ERROR", error_msg);
-                        return;
-                    }
-                    double dur = std::chrono::duration<double>(
-                        std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
-                    BatchAddSuccessResult(bind_data, "tblVorlauf (updated)", 0, group.vorlauf_id, dur);
+                    // Vorlauf already exists (from source data) — reuse as-is.
+                    BatchAddSuccessResult(bind_data, "tblVorlauf (reused)", 0, group.vorlauf_id, 0.0);
                 } else {
                     string vorlauf_sql = BuildVorlaufInsertSQL(
                         bind_data.secret_name, group.vorlauf_id, group.gui_verfahren_id,
@@ -3080,7 +3031,10 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
 
             string timestamp = GetCurrentTimestamp();
             string date_fallback = group.date_to;
-            string vorlauf_datum_bis = group.date_to + " 00:00:00";
+            // Use the actual dtmVorlaufDatumBis from DB when reusing (FK requires exact match).
+            string vorlauf_datum_bis = group.reuse_existing && !group.vorlauf_datum_bis.empty()
+                ? group.vorlauf_datum_bis
+                : group.date_to + " 00:00:00";
 
             if (!BatchPopulateStagingTable(*state.staging_conn, bind_data,
                                             group.row_indices, group.primanota_ids,
