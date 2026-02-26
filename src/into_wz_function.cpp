@@ -2809,9 +2809,10 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
 
         // Process one group per Execute call to allow progress updates
         if (state.current_group_idx >= state.groups.size()) {
-            // All groups processed - commit
+            // All groups processed - transition to FINALIZE.
+            // Must add a result row so DuckDB doesn't see 0 rows and stop the pipeline.
             state.phase = BatchExecutionPhase::FINALIZE;
-            // Fall through to FINALIZE on next call
+            BatchAddSuccessResult(bind_data, "PROGRESS:committing", 0, "", 0.0);
             BatchOutputResults(bind_data, state, output);
             return;
         }
