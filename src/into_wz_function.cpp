@@ -661,8 +661,8 @@ static string BuildVorlaufInsertSQL(const string &db_name,
     sql << "'" << EscapeSqlString(verfahren_id) << "', ";  // guiVerfahrenID
     sql << konten_rahmen_id << ", ";  // lngKanzleiKontenRahmenID
     sql << "1, ";  // lngStatus
-    sql << "'" << CompactDateYYYYMMDD(date_to) << "', ";  // dtmVorlaufDatumBis
-    sql << "'" << CompactDateYYYYMMDD(date_from) << "', ";  // dtmVorlaufDatumVon
+    sql << "'" << NormalizeDateToISO(date_to) << " 00:00:00', ";  // dtmVorlaufDatumBis
+    sql << "'" << NormalizeDateToISO(date_from) << " 00:00:00', ";  // dtmVorlaufDatumVon
     sql << "NULL, ";  // lngVorlaufNr
     sql << "'" << EscapeSqlString(bezeichnung) << "', ";  // strBezeichnung
     sql << "NULL, ";  // dtmDatevExport
@@ -1611,8 +1611,8 @@ static bool BatchCreateVorlaufRecords(Connection &txn_conn,
                 << "'" << EscapeSqlString(mi.vorlauf_id) << "', "
                 << "'" << EscapeSqlString(gui_verfahren_id) << "', "
                 << konten_rahmen_id << ", 1, "
-                << "'" << CompactDateYYYYMMDD(mi.date_to) << "', "
-                << "'" << CompactDateYYYYMMDD(mi.date_from) << "', "
+                << "'" << NormalizeDateToISO(mi.date_to) << " 00:00:00', "
+                << "'" << NormalizeDateToISO(mi.date_from) << " 00:00:00', "
                 << "NULL, "
                 << "'" << EscapeSqlString(mi.bezeichnung) << "', "
                 << "NULL, 0)";
