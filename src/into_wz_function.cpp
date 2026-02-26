@@ -965,12 +965,12 @@ static bool FindExistingVorlauf(Connection &conn,
                                 string &error_message) {
     existing_vorlauf_id.clear();
 
-    string sql = "SELECT TOP 1 CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID"
+    string sql = "SELECT CAST(guiVorlaufID AS VARCHAR(36)) AS guiVorlaufID"
                  " FROM " + db_name + ".dbo.tblVorlauf"
                  " WHERE guiVerfahrenID = '" + EscapeSqlString(verfahren_id) + "'"
                  " AND dtmVorlaufDatumVon <= '" + EscapeSqlString(date_from) + " 00:00:00'"
                  " AND dtmVorlaufDatumBis >= '" + EscapeSqlString(date_to) + " 00:00:00'"
-                 " ORDER BY dtmAngelegt DESC";
+                 " ORDER BY dtmAngelegt DESC LIMIT 1";
 
     auto result = conn.Query(sql);
     if (result->HasError()) {
