@@ -248,6 +248,7 @@ struct VerfahrenGroup {
     string date_to;
     string bezeichnung;
     vector<string> primanota_ids;
+    bool reuse_existing = false;
 };
 
 struct BatchIntoWzGlobalState : public GlobalTableFunctionState {
@@ -304,6 +305,7 @@ struct IntoWzGlobalState : public GlobalTableFunctionState {
     vector<string> primanota_ids;
     bool vorlauf_id_from_source;
     bool skip_vorlauf_insert;
+    bool try_vorlauf_reuse;
 
     // Monatsvorlauf state
     vector<MonthInfo> months;
@@ -311,7 +313,7 @@ struct IntoWzGlobalState : public GlobalTableFunctionState {
 
     IntoWzGlobalState() : current_idx(0), phase(ExecutionPhase::VALIDATE_PARAMS),
                            progress(0.0), vorlauf_id_from_source(false),
-                           skip_vorlauf_insert(false) {}
+                           skip_vorlauf_insert(false), try_vorlauf_reuse(false) {}
 };
 
 // Progress callback: DuckDB polls this between Execute calls.
@@ -1936,7 +1938,16 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
             }
         } else {
             // --- Single-vorlauf pre-computation ---
+
+            // Compute date range first (needed for Vorlauf reuse lookup)
+            auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
+            state.date_from = date_range.first;
+            state.date_to = date_range.second;
+            if (state.date_from.empty()) state.date_from = GetCurrentMonthStart();
+            if (state.date_to.empty()) state.date_to = GetCurrentDate();
+
             if (!bind_data.generate_vorlauf_id) {
+                // User provided vorlauf_id in source column — respect it
                 idx_t vorlauf_id_col = FindVorlaufIdColumn(bind_data.source_columns);
                 if (vorlauf_id_col != DConstants::INVALID_INDEX
                     && !bind_data.source_rows.empty()
@@ -1946,15 +1957,16 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                     state.vorlauf_id_from_source = true;
                 }
             }
-            if (state.vorlauf_id.empty()) {
-                state.vorlauf_id = GenerateVorlaufUUID(bind_data.row_keys, bind_data.gui_verfahren_id);
+
+            // If no source-provided ID and generating is enabled, try reuse first
+            if (state.vorlauf_id.empty() && bind_data.generate_vorlauf_id) {
+                state.try_vorlauf_reuse = true;
             }
 
-            auto date_range = FindDateRange(bind_data.source_rows, bind_data.source_columns);
-            state.date_from = date_range.first;
-            state.date_to = date_range.second;
-            if (state.date_from.empty()) state.date_from = GetCurrentMonthStart();
-            if (state.date_to.empty()) state.date_to = GetCurrentDate();
+            // If not trying reuse and still no ID, generate one now
+            if (state.vorlauf_id.empty() && !state.try_vorlauf_reuse) {
+                state.vorlauf_id = GenerateVorlaufUUID(bind_data.row_keys, bind_data.gui_verfahren_id);
+            }
 
             state.bezeichnung = DeriveVorlaufBezeichnung(state.date_from, state.date_to);
 
@@ -2146,8 +2158,27 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                 state.bezeichnung = std::move(derived_bezeichnung);
             }
 
+            // Try to reuse an existing Vorlauf (query-first lookup)
+            if (state.try_vorlauf_reuse) {
+                string existing_id;
+                if (!FindExistingVorlauf(*state.txn_conn, bind_data.secret_name,
+                                          bind_data.gui_verfahren_id,
+                                          state.date_from, state.date_to,
+                                          existing_id, error_msg)) {
+                    CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg);
+                    return;
+                }
+                if (!existing_id.empty()) {
+                    state.vorlauf_id = existing_id;
+                    state.skip_vorlauf_insert = true;
+                } else {
+                    // No reusable Vorlauf found — generate new UUID
+                    state.vorlauf_id = GenerateVorlaufUUID(bind_data.row_keys, bind_data.gui_verfahren_id);
+                }
+            }
+
             // Check if vorlauf exists (for source-provided IDs)
-            if (state.vorlauf_id_from_source) {
+            if (state.vorlauf_id_from_source && !state.skip_vorlauf_insert) {
                 bool exists = false;
                 if (!VorlaufExists(*state.txn_conn, bind_data.secret_name, state.vorlauf_id, exists, error_msg)) {
                     CleanupAndError(state, bind_data, output, "tblVorlauf", error_msg, state.vorlauf_id);
@@ -2911,28 +2942,46 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
             group.date_to = max_date;
         }
 
-        // 3. Generate Vorlauf UUID
-        if (bind_data.generate_vorlauf_id) {
-            // Build combined key from this group's row keys
-            string combined_key = "vorlauf:" + group.gui_verfahren_id + ":";
-            for (size_t i = 0; i < group.row_indices.size(); i++) {
-                if (i > 0) combined_key += "||";
-                combined_key += bind_data.row_keys[group.row_indices[i]];
-            }
-            group.vorlauf_id = GenerateUUIDv5(combined_key);
-        } else {
-            // Try to read from source
-            idx_t vorlauf_col = FindVorlaufIdColumn(bind_data.source_columns);
-            if (vorlauf_col != DConstants::INVALID_INDEX) {
-                const auto &first_row = bind_data.source_rows[group.row_indices[0]];
-                if (vorlauf_col < first_row.size() && !first_row[vorlauf_col].IsNull()) {
-                    group.vorlauf_id = first_row[vorlauf_col].ToString();
+        // 3. Find existing Vorlauf or generate new UUID
+        {
+            string existing_id;
+            if (bind_data.generate_vorlauf_id) {
+                // Try reuse first
+                if (!FindExistingVorlauf(*state.txn_conn, bind_data.secret_name,
+                                          group.gui_verfahren_id,
+                                          group.date_from, group.date_to,
+                                          existing_id, error_msg)) {
+                    BatchCleanupAndError(state, bind_data, output, "ERROR",
+                        "Failed to find existing Vorlauf for group " + group.gui_verfahren_id + ": " + error_msg);
+                    return;
                 }
             }
-            if (group.vorlauf_id.empty()) {
-                BatchCleanupAndError(state, bind_data, output, "ERROR",
-                    "generate_vorlauf_id=false but no guiVorlaufID column found for group " + group.gui_verfahren_id);
-                return;
+
+            if (!existing_id.empty()) {
+                group.vorlauf_id = existing_id;
+                group.reuse_existing = true;
+            } else if (bind_data.generate_vorlauf_id) {
+                // No reusable Vorlauf — generate new UUID
+                string combined_key = "vorlauf:" + group.gui_verfahren_id + ":";
+                for (size_t i = 0; i < group.row_indices.size(); i++) {
+                    if (i > 0) combined_key += "||";
+                    combined_key += bind_data.row_keys[group.row_indices[i]];
+                }
+                group.vorlauf_id = GenerateUUIDv5(combined_key);
+            } else {
+                // Try to read from source
+                idx_t vorlauf_col = FindVorlaufIdColumn(bind_data.source_columns);
+                if (vorlauf_col != DConstants::INVALID_INDEX) {
+                    const auto &first_row = bind_data.source_rows[group.row_indices[0]];
+                    if (vorlauf_col < first_row.size() && !first_row[vorlauf_col].IsNull()) {
+                        group.vorlauf_id = first_row[vorlauf_col].ToString();
+                    }
+                }
+                if (group.vorlauf_id.empty()) {
+                    BatchCleanupAndError(state, bind_data, output, "ERROR",
+                        "generate_vorlauf_id=false but no guiVorlaufID column found for group " + group.gui_verfahren_id);
+                    return;
+                }
             }
         }
 
@@ -2951,16 +3000,11 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
 
         // 5. Insert or update Vorlauf record
         {
-            bool exists = false;
-            if (!VorlaufExists(*state.txn_conn, bind_data.secret_name, group.vorlauf_id, exists, error_msg)) {
-                BatchCleanupAndError(state, bind_data, output, "ERROR", error_msg);
-                return;
-            }
-
             double vorlauf_start_t = std::chrono::duration<double>(
                 std::chrono::high_resolution_clock::now() - group_start).count();
 
-            if (exists) {
+            if (group.reuse_existing) {
+                // Reusing existing Vorlauf — update bezeichnung
                 if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name,
                                     group.vorlauf_id, group.date_to,
                                     group.bezeichnung, bind_data.str_angelegt, error_msg)) {
@@ -2969,21 +3013,39 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
                 }
                 double dur = std::chrono::duration<double>(
                     std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
-                BatchAddSuccessResult(bind_data, "tblVorlauf (updated)", 0, group.vorlauf_id, dur);
+                BatchAddSuccessResult(bind_data, "tblVorlauf (reused)", 0, group.vorlauf_id, dur);
             } else {
-                string vorlauf_sql = BuildVorlaufInsertSQL(
-                    bind_data.secret_name, group.vorlauf_id, group.gui_verfahren_id,
-                    bind_data.lng_kanzlei_konten_rahmen_id, bind_data.str_angelegt,
-                    group.date_from, group.date_to, group.bezeichnung);
-
-                if (!ExecuteMssqlStatement(*state.txn_conn, vorlauf_sql, error_msg)) {
-                    BatchCleanupAndError(state, bind_data, output, "ERROR",
-                        "Failed to insert tblVorlauf for group " + group.gui_verfahren_id + ": " + error_msg);
+                bool exists = false;
+                if (!VorlaufExists(*state.txn_conn, bind_data.secret_name, group.vorlauf_id, exists, error_msg)) {
+                    BatchCleanupAndError(state, bind_data, output, "ERROR", error_msg);
                     return;
                 }
-                double dur = std::chrono::duration<double>(
-                    std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
-                BatchAddSuccessResult(bind_data, "tblVorlauf", 1, group.vorlauf_id, dur);
+
+                if (exists) {
+                    if (!UpdateVorlauf(*state.txn_conn, bind_data.secret_name,
+                                        group.vorlauf_id, group.date_to,
+                                        group.bezeichnung, bind_data.str_angelegt, error_msg)) {
+                        BatchCleanupAndError(state, bind_data, output, "ERROR", error_msg);
+                        return;
+                    }
+                    double dur = std::chrono::duration<double>(
+                        std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
+                    BatchAddSuccessResult(bind_data, "tblVorlauf (updated)", 0, group.vorlauf_id, dur);
+                } else {
+                    string vorlauf_sql = BuildVorlaufInsertSQL(
+                        bind_data.secret_name, group.vorlauf_id, group.gui_verfahren_id,
+                        bind_data.lng_kanzlei_konten_rahmen_id, bind_data.str_angelegt,
+                        group.date_from, group.date_to, group.bezeichnung);
+
+                    if (!ExecuteMssqlStatement(*state.txn_conn, vorlauf_sql, error_msg)) {
+                        BatchCleanupAndError(state, bind_data, output, "ERROR",
+                            "Failed to insert tblVorlauf for group " + group.gui_verfahren_id + ": " + error_msg);
+                        return;
+                    }
+                    double dur = std::chrono::duration<double>(
+                        std::chrono::high_resolution_clock::now() - group_start).count() - vorlauf_start_t;
+                    BatchAddSuccessResult(bind_data, "tblVorlauf", 1, group.vorlauf_id, dur);
+                }
             }
         }
 
