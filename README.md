@@ -137,6 +137,7 @@ Imports data from a DuckDB table into WZ MSSQL tables (tblVorlauf and tblPrimano
 | `lng_kanzlei_konten_rahmen_id` | BIGINT | **Yes** | - | The KontenRahmenID (chart of accounts ID) |
 | `str_angelegt` | VARCHAR | No | `wz_extension` | User who created the record |
 | `generate_vorlauf_id` | BOOLEAN | No | `true` | Auto-generate guiVorlaufID |
+| `reuse_vorlauf` | BOOLEAN | No | `true` | Reuse existing Vorlauf records that cover the required date range instead of creating new ones |
 | `monatsvorlauf` | BOOLEAN | No | `false` | Split inserts by month — creates a separate tblVorlauf + tblPrimanota batch per calendar month |
 | `skip_duplicate_check` | BOOLEAN | No | `false` | Skip duplicate guiPrimanotaID check before insert |
 | `skip_fk_check` | BOOLEAN | No | `false` | Skip foreign key constraint validation before insert |
@@ -149,30 +150,30 @@ Returns a table with insert status for each table:
 |--------|------|-------------|
 | `table_name` | VARCHAR | Name of the table (tblVorlauf, tblPrimanota, or ERROR) |
 | `rows_inserted` | BIGINT | Number of rows inserted |
-| `gui_vorlauf_id` | VARCHAR | The generated VorlaufID |
-| `duration_seconds` | DOUBLE | Time taken for the insert |
+| `gui_vorlauf_id` | VARCHAR | The generated or reused VorlaufID |
+| `duration` | VARCHAR | Time taken (hh:mm:ss) |
 | `success` | BOOLEAN | Whether the insert succeeded |
 | `error_message` | VARCHAR | Error details if failed |
 
 #### Example Output (Success)
 
 ```
-┌──────────────┬───────────────┬──────────────────────────────────────┬──────────────────┬─────────┬───────────────┐
-│ table_name   │ rows_inserted │ gui_vorlauf_id                       │ duration_seconds │ success │ error_message │
-├──────────────┼───────────────┼──────────────────────────────────────┼──────────────────┼─────────┼───────────────┤
-│ tblVorlauf   │ 1             │ 96719177-432b-5a03-ad2d-3a01cac13a53 │ 0.12             │ true    │               │
-│ tblPrimanota │ 150           │ 96719177-432b-5a03-ad2d-3a01cac13a53 │ 1.45             │ true    │               │
-└──────────────┴───────────────┴──────────────────────────────────────┴──────────────────┴─────────┴───────────────┘
+┌──────────────┬───────────────┬──────────────────────────────────────┬──────────┬─────────┬───────────────┐
+│ table_name   │ rows_inserted │ gui_vorlauf_id                       │ duration │ success │ error_message │
+├──────────────┼───────────────┼──────────────────────────────────────┼──────────┼─────────┼───────────────┤
+│ tblVorlauf   │ 1             │ 96719177-432b-5a03-ad2d-3a01cac13a53 │ 00:00:00 │ true    │               │
+│ tblPrimanota │ 150           │ 96719177-432b-5a03-ad2d-3a01cac13a53 │ 00:00:01 │ true    │               │
+└──────────────┴───────────────┴──────────────────────────────────────┴──────────┴─────────┴───────────────┘
 ```
 
 #### Example Output (Duplicate Error)
 
 ```
-┌────────────┬───────────────┬────────────────┬──────────────────┬─────────┬─────────────────────────────────────────────────────────┐
-│ table_name │ rows_inserted │ gui_vorlauf_id │ duration_seconds │ success │ error_message                                           │
-├────────────┼───────────────┼────────────────┼──────────────────┼─────────┼─────────────────────────────────────────────────────────┤
-│ ERROR      │ 0             │                │ 0.0              │ false   │ Duplicate guiPrimanotaID found: abc-123, def-456, ...   │
-└────────────┴───────────────┴────────────────┴──────────────────┴─────────┴─────────────────────────────────────────────────────────┘
+┌────────────┬───────────────┬────────────────┬──────────┬─────────┬─────────────────────────────────────────────────────────┐
+│ table_name │ rows_inserted │ gui_vorlauf_id │ duration │ success │ error_message                                           │
+├────────────┼───────────────┼────────────────┼──────────┼─────────┼─────────────────────────────────────────────────────────┤
+│ ERROR      │ 0             │                │ 00:00:00 │ false   │ Duplicate guiPrimanotaID found: abc-123, def-456, ...   │
+└────────────┴───────────────┴────────────────┴──────────┴─────────┴─────────────────────────────────────────────────────────┘
 ```
 
 #### Example: Monthly Split (Monatsvorlauf)
@@ -189,19 +190,19 @@ SELECT * FROM into_wz(
 
 Example output with `monatsvorlauf := true` (one Vorlauf per month):
 ```
-┌──────────────┬───────────────┬──────────────────────────────────────┬──────────────────┬─────────┬───────────────┐
-│ table_name   │ rows_inserted │ gui_vorlauf_id                       │ duration_seconds │ success │ error_message │
-├──────────────┼───────────────┼──────────────────────────────────────┼──────────────────┼─────────┼───────────────┤
-│ tblVorlauf   │ 1             │ a1b2c3d4-e5f6-5a7b-8c9d-0e1f2a3b4c5d │ 0.08             │ true    │               │
-│ tblPrimanota │ 45            │ a1b2c3d4-e5f6-5a7b-8c9d-0e1f2a3b4c5d │ 0.52             │ true    │               │
-│ tblVorlauf   │ 1             │ f6a7b8c9-d0e1-5f2a-3b4c-5d6e7f8a9b0c │ 0.07             │ true    │               │
-│ tblPrimanota │ 105           │ f6a7b8c9-d0e1-5f2a-3b4c-5d6e7f8a9b0c │ 1.12             │ true    │               │
-└──────────────┴───────────────┴──────────────────────────────────────┴──────────────────┴─────────┴───────────────┘
+┌──────────────┬───────────────┬──────────────────────────────────────┬──────────┬─────────┬───────────────┐
+│ table_name   │ rows_inserted │ gui_vorlauf_id                       │ duration │ success │ error_message │
+├──────────────┼───────────────┼──────────────────────────────────────┼──────────┼─────────┼───────────────┤
+│ tblVorlauf   │ 1             │ a1b2c3d4-e5f6-5a7b-8c9d-0e1f2a3b4c5d │ 00:00:00 │ true    │               │
+│ tblPrimanota │ 45            │ a1b2c3d4-e5f6-5a7b-8c9d-0e1f2a3b4c5d │ 00:00:00 │ true    │               │
+│ tblVorlauf   │ 1             │ f6a7b8c9-d0e1-5f2a-3b4c-5d6e7f8a9b0c │ 00:00:00 │ true    │               │
+│ tblPrimanota │ 105           │ f6a7b8c9-d0e1-5f2a-3b4c-5d6e7f8a9b0c │ 00:00:01 │ true    │               │
+└──────────────┴───────────────┴──────────────────────────────────────┴──────────┴─────────┴───────────────┘
 ```
 
 ### `batch_into_wz`
 
-Batch version of `into_wz` that processes multiple `gui_verfahren_id` values from a single source table. Groups rows by their `gui_verfahren_id` column, creates a Vorlauf for each group, and inserts the corresponding Primanota rows within a single all-or-nothing MSSQL transaction.
+Batch version of `into_wz` that processes multiple `gui_verfahren_id` values from a single source table. Groups rows by their `gui_verfahren_id` column, creates (or reuses) a Vorlauf for each group, and inserts the corresponding Primanota rows within a single all-or-nothing MSSQL transaction.
 
 ```sql
 SELECT * FROM batch_into_wz(
@@ -212,14 +213,84 @@ SELECT * FROM batch_into_wz(
 );
 ```
 
-The source table must contain a `gui_verfahren_id` column (accepted names: `guiVerfahrenID`, `gui_verfahren_id`, `guiverfahrenid`, `verfahren_id`, `verfahrenid`).
+The source table must contain a `gui_verfahren_id` column (accepted names: `guiVerfahrenID`, `gui_verfahren_id`, `guiverfahrenid`, `verfahren_id`, `verfahrenid`). Every row must have a non-NULL, valid UUID value in that column.
 
 #### Parameters
 
-Same as `into_wz` except:
-- **No `gui_verfahren_id` parameter** — read from the source data column
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `secret` | VARCHAR | No | `mssql_conn` | Name of the MSSQL connection secret |
+| `source_table` | VARCHAR | **Yes** | - | Name of the DuckDB table containing source data |
+| `lng_kanzlei_konten_rahmen_id` | BIGINT | **Yes** | - | The KontenRahmenID (chart of accounts ID) |
+| `str_angelegt` | VARCHAR | No | `wz_extension` | User who created the record |
+| `generate_vorlauf_id` | BOOLEAN | No | `true` | Auto-generate guiVorlaufID per group |
+| `reuse_vorlauf` | BOOLEAN | No | `true` | Reuse existing Vorlauf records that cover the required date range instead of creating new ones |
+| `skip_duplicate_check` | BOOLEAN | No | `false` | Skip duplicate guiPrimanotaID check before insert |
+| `skip_fk_check` | BOOLEAN | No | `false` | Skip foreign key constraint validation before insert |
+
+**Key differences from `into_wz`:**
+- **No `gui_verfahren_id` parameter** — read from the source data column instead
 - **No `monatsvorlauf` parameter** — grouping is by `gui_verfahren_id`
 - Uses INSERT-only transfer (no BCP) to maintain all-or-nothing transaction atomicity
+
+#### Return Value
+
+Returns a table with per-group results plus a summary row:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `table_name` | VARCHAR | Group identifier (`GROUP:<verfahren_id>`), table name, or `TOTAL` |
+| `rows_inserted` | BIGINT | Number of rows inserted |
+| `gui_vorlauf_id` | VARCHAR | The generated or reused VorlaufID for the group |
+| `duration` | VARCHAR | Time taken (hh:mm:ss) |
+| `success` | BOOLEAN | Whether the operation succeeded |
+| `error_message` | VARCHAR | Error details if failed |
+
+#### Example
+
+```sql
+-- Source table with bookings for multiple Verfahren
+CREATE TABLE multi_verfahren_bookings AS
+SELECT
+    '6cd5c439-110a-4e65-b7b6-0be000b58588' AS gui_verfahren_id,
+    'ddebd948-4084-5c56-b339-f9b50474b586' AS guiPrimanotaID,
+    '2025-09-01' AS dtmBelegDatum,
+    630014.0 AS decKontoNr,
+    307000.0 AS decGegenkontoNr,
+    false AS ysnSoll,
+    854.15 AS curEingabeBetrag,
+    '330# Personalgewinnung' AS strBuchText
+UNION ALL
+SELECT
+    'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+    '5e9ef551-4e05-5bca-a699-051e680451fa',
+    '2025-10-15',
+    1800.0,
+    1590.0,
+    false,
+    8851.87,
+    'Sauna Poo org';
+
+-- Process all groups in one call
+SELECT * FROM batch_into_wz(
+    secret := 'mssql_secret',
+    source_table := 'multi_verfahren_bookings',
+    lng_kanzlei_konten_rahmen_id := 56,
+    str_angelegt := 'myuser'
+);
+```
+
+#### Example Output
+
+```
+┌─────────────────────────────────────────────────────┬───────────────┬──────────────────────────────────────┬──────────┬─────────┬───────────────┐
+│ table_name                                          │ rows_inserted │ gui_vorlauf_id                       │ duration │ success │ error_message │
+├─────────────────────────────────────────────────────┼───────────────┼──────────────────────────────────────┼──────────┼─────────┼───────────────┤
+│ GROUP:6cd5c439-110a-4e65-b7b6-0be000b58588          │ 1             │ 96719177-432b-5a03-ad2d-3a01cac13a53 │ 00:00:01 │ true    │               │
+│ GROUP:a1b2c3d4-e5f6-7890-abcd-ef1234567890          │ 1             │ b8c9d0e1-f2a3-5b4c-5d6e-7f8a9b0c1d2e │ 00:00:00 │ true    │               │
+│ TOTAL                                               │ 2             │                                      │ 00:00:01 │ true    │               │
+└─────────────────────────────────────────────────────┴───────────────┴──────────────────────────────────────┴──────────┴─────────┴───────────────┘
+```
 
 #### Transaction Semantics
 
@@ -467,12 +538,12 @@ SELECT * FROM into_wz(
 - Queries MSSQL `tblPrimanota` to check for existing IDs
 - Fails with detailed error listing duplicates if any found
 
-### 3. Vorlauf Creation
-- Generates a new UUID for `guiVorlaufID`
+### 3. Vorlauf Creation / Reuse
+- When `reuse_vorlauf := true` (default), queries `tblVorlauf` for an existing record matching the same `guiVerfahrenID` and covering the required date range — if found, reuses it instead of creating a new one
+- When no existing Vorlauf is found (or `reuse_vorlauf := false`), generates a new deterministic UUID v5 for `guiVorlaufID`
 - Scans all dates to find MIN/MAX `dtmBelegDatum`
 - Derives `strBezeichnung` like "Vorlauf 09/2025-09/2025"
 - Sets `lngStatus = 1` (active)
-- If the Vorlauf already exists (same UUID), it is **updated** (`strBezeichnung`, `dtmVorlaufDatumBis`, `strGeaendert`, `dtmGeaendert`) instead of inserted
 
 ### 4. Transaction Handling
 ```
