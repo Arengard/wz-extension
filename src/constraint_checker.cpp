@@ -165,6 +165,13 @@ bool ValidateForeignKeys(ClientContext &context,
     vector<string> violation_messages;
 
     for (auto &fk : constraints) {
+        // Skip constraints referencing tblVorlauf — the extension creates/reuses
+        // Vorlauf records in the same transaction, so they won't exist yet at
+        // validation time.
+        if (fk.referenced_table == "tblVorlauf") {
+            continue;
+        }
+
         // Find the source column index using shared alias mapping (wz_utils.hpp)
         idx_t source_col_idx = FindColumnWithAliases(source_columns, fk.column_name);
         if (source_col_idx == DConstants::INVALID_INDEX) {
