@@ -488,6 +488,36 @@ static vector<string> PreComputePrimanotaIds(const vector<vector<Value>> &rows,
 }
 
 // ============================================================================
+// Helper: Normalize date string to YYYY-MM-DD format.
+// Handles DD-MM-YYYY, DD.MM.YYYY, DD/MM/YYYY -> YYYY-MM-DD conversion.
+// If already YYYY-MM-DD (or YYYY-...), returns as-is (first 10 chars).
+// ============================================================================
+
+static string NormalizeDateToISO(const string &raw) {
+    string s = raw;
+    if (s.length() > 10) s = s.substr(0, 10);
+    if (s.length() < 10) return s;
+
+    // Detect DD-MM-YYYY / DD.MM.YYYY / DD/MM/YYYY:
+    // Positions 2 and 5 are separators, first two chars are day (01-31)
+    char sep = s[2];
+    if ((sep == '-' || sep == '.' || sep == '/') && s[5] == sep) {
+        // DD?MM?YYYY -> YYYY-MM-DD
+        string dd = s.substr(0, 2);
+        string mm = s.substr(3, 2);
+        string yyyy = s.substr(6, 4);
+        return yyyy + "-" + mm + "-" + dd;
+    }
+
+    // Already YYYY-MM-DD or other format - normalize separators to dash
+    if (s[4] == '.' || s[4] == '/') {
+        s[4] = '-';
+        s[7] = '-';
+    }
+    return s;
+}
+
+// ============================================================================
 // Helper: Find date range in source data
 // ============================================================================
 
@@ -504,11 +534,7 @@ static pair<string, string> FindDateRange(const vector<vector<Value>> &rows,
 
     for (const auto &row : rows) {
         if (date_col < row.size() && !row[date_col].IsNull()) {
-            string date_str = row[date_col].ToString();
-            // Normalize date string (take first 10 chars for YYYY-MM-DD)
-            if (date_str.length() >= 10) {
-                date_str = date_str.substr(0, 10);
-            }
+            string date_str = NormalizeDateToISO(row[date_col].ToString());
             if (min_date.empty() || date_str < min_date) {
                 min_date = date_str;
             }
@@ -2831,8 +2857,7 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
                 for (const auto &row_idx : group.row_indices) {
                     const auto &row = bind_data.source_rows[row_idx];
                     if (date_col < row.size() && !row[date_col].IsNull()) {
-                        string date_str = row[date_col].ToString();
-                        if (date_str.length() >= 10) date_str = date_str.substr(0, 10);
+                        string date_str = NormalizeDateToISO(row[date_col].ToString());
                         if (min_date.empty() || date_str < min_date) min_date = date_str;
                         if (max_date.empty() || date_str > max_date) max_date = date_str;
                     }
