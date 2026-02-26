@@ -970,7 +970,7 @@ static bool FindExistingVorlauf(Connection &conn,
                  " WHERE guiVerfahrenID = '" + EscapeSqlString(verfahren_id) + "'"
                  " AND dtmVorlaufDatumVon <= '" + EscapeSqlString(date_from) + " 00:00:00'"
                  " AND dtmVorlaufDatumBis >= '" + EscapeSqlString(date_to) + " 00:00:00'"
-                 " ORDER BY dtmAngelegt DESC LIMIT 1";
+                 " ORDER BY dtmAngelegt DESC";
 
     auto result = conn.Query(sql);
     if (result->HasError()) {
