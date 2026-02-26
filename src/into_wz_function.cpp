@@ -178,6 +178,7 @@ struct IntoWzBindData : public TableFunctionData {
     int64_t lng_kanzlei_konten_rahmen_id;
     string str_angelegt;
     bool generate_vorlauf_id;
+    bool reuse_vorlauf;
     bool monatsvorlauf;
     bool skip_duplicate_check;
     bool skip_fk_check;
@@ -206,6 +207,7 @@ struct BatchIntoWzBindData : public TableFunctionData {
     int64_t lng_kanzlei_konten_rahmen_id;
     string str_angelegt;
     bool generate_vorlauf_id;
+    bool reuse_vorlauf;
     bool monatsvorlauf;
     bool skip_duplicate_check;
     bool skip_fk_check;
@@ -692,6 +694,7 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
 
     // Set defaults (overridden by parsed parameters below)
     bind_data->generate_vorlauf_id = true;
+    bind_data->reuse_vorlauf = true;
     bind_data->monatsvorlauf = false;
     bind_data->skip_duplicate_check = false;
     bind_data->skip_fk_check = false;
@@ -711,6 +714,8 @@ static unique_ptr<FunctionData> IntoWzBind(ClientContext &context,
             if (!kv.second.IsNull()) bind_data->str_angelegt = StringValue::Get(kv.second);
         } else if (kv.first == "generate_vorlauf_id") {
             if (!kv.second.IsNull()) bind_data->generate_vorlauf_id = kv.second.GetValue<bool>();
+        } else if (kv.first == "reuse_vorlauf") {
+            if (!kv.second.IsNull()) bind_data->reuse_vorlauf = kv.second.GetValue<bool>();
         } else if (kv.first == "monatsvorlauf") {
             if (!kv.second.IsNull()) bind_data->monatsvorlauf = kv.second.GetValue<bool>();
         } else if (kv.first == "skip_duplicate_check") {
@@ -1947,8 +1952,8 @@ static void IntoWzExecute(ClientContext &context, TableFunctionInput &data_p, Da
                 }
             }
 
-            // If no source-provided ID and generating is enabled, try reuse first
-            if (state.vorlauf_id.empty() && bind_data.generate_vorlauf_id) {
+            // If no source-provided ID and reuse is enabled, try reuse first
+            if (state.vorlauf_id.empty() && bind_data.reuse_vorlauf) {
                 state.try_vorlauf_reuse = true;
             }
 
@@ -2370,6 +2375,7 @@ static unique_ptr<FunctionData> BatchIntoWzBind(ClientContext &context,
 
     // Set defaults
     bind_data->generate_vorlauf_id = true;
+    bind_data->reuse_vorlauf = true;
     bind_data->monatsvorlauf = false;
     bind_data->skip_duplicate_check = false;
     bind_data->skip_fk_check = false;
@@ -2390,6 +2396,8 @@ static unique_ptr<FunctionData> BatchIntoWzBind(ClientContext &context,
             bind_data->str_angelegt = StringValue::Get(kv.second);
         } else if (kv.first == "generate_vorlauf_id") {
             bind_data->generate_vorlauf_id = kv.second.GetValue<bool>();
+        } else if (kv.first == "reuse_vorlauf") {
+            bind_data->reuse_vorlauf = kv.second.GetValue<bool>();
         } else if (kv.first == "monatsvorlauf") {
             bind_data->monatsvorlauf = kv.second.GetValue<bool>();
         } else if (kv.first == "skip_duplicate_check") {
@@ -2932,7 +2940,7 @@ static void BatchIntoWzExecute(ClientContext &context, TableFunctionInput &data_
         // 3. Find existing Vorlauf or generate new UUID
         {
             string existing_id, existing_bis;
-            if (bind_data.generate_vorlauf_id) {
+            if (bind_data.reuse_vorlauf) {
                 // Try reuse first
                 if (!FindExistingVorlauf(*state.txn_conn, bind_data.secret_name,
                                           group.gui_verfahren_id,
@@ -3132,6 +3140,7 @@ void RegisterIntoWzFunction(DatabaseInstance &db) {
     into_wz_func.named_parameters["lng_kanzlei_konten_rahmen_id"] = LogicalType::BIGINT;
     into_wz_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
     into_wz_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
+    into_wz_func.named_parameters["reuse_vorlauf"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["monatsvorlauf"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["skip_duplicate_check"] = LogicalType::BOOLEAN;
     into_wz_func.named_parameters["skip_fk_check"] = LogicalType::BOOLEAN;
@@ -3156,6 +3165,7 @@ void RegisterBatchIntoWzFunction(DatabaseInstance &db) {
     batch_func.named_parameters["lng_kanzlei_konten_rahmen_id"] = LogicalType::BIGINT;
     batch_func.named_parameters["str_angelegt"] = LogicalType::VARCHAR;
     batch_func.named_parameters["generate_vorlauf_id"] = LogicalType::BOOLEAN;
+    batch_func.named_parameters["reuse_vorlauf"] = LogicalType::BOOLEAN;
     batch_func.named_parameters["skip_duplicate_check"] = LogicalType::BOOLEAN;
     batch_func.named_parameters["skip_fk_check"] = LogicalType::BOOLEAN;
 
