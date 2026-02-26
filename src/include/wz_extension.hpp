@@ -59,6 +59,7 @@ bool ValidateForeignKeys(ClientContext &context,
 
 // Table function registration
 void RegisterIntoWzFunction(DatabaseInstance &db);
+void RegisterBatchIntoWzFunction(DatabaseInstance &db);
 void RegisterMoveToMssqlFunction(DatabaseInstance &db);
 void RegisterStpsDropAllFunction(DatabaseInstance &db);
 

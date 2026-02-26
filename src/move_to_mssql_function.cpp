@@ -174,7 +174,9 @@ static unique_ptr<FunctionData> MoveToMssqlBind(ClientContext &context,
         auto lower_name = kv.first;
         std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
 
-        if (lower_name == "secret") {
+        if (kv.second.IsNull()) {
+            continue;
+        } else if (lower_name == "secret") {
             bind_data->secret_name = kv.second.GetValue<string>();
         } else if (lower_name == "schema" || lower_name == "mssql_schema") {
             bind_data->target_schema = kv.second.GetValue<string>();

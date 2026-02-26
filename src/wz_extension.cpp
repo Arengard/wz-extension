@@ -21,6 +21,7 @@ void WzExtension::Load(ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
     TryAutoLoadMssql(db);
     RegisterIntoWzFunction(db);
+    RegisterBatchIntoWzFunction(db);
     RegisterMoveToMssqlFunction(db);
     RegisterStpsDropAllFunction(db);
 }
@@ -42,6 +43,7 @@ DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
     duckdb::TryAutoLoadMssql(db);
     duckdb::RegisterIntoWzFunction(db);
+    duckdb::RegisterBatchIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
     duckdb::RegisterStpsDropAllFunction(db);
 }
@@ -50,6 +52,7 @@ DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
 DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
     duckdb::TryAutoLoadMssql(db);
     duckdb::RegisterIntoWzFunction(db);
+    duckdb::RegisterBatchIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
     duckdb::RegisterStpsDropAllFunction(db);
 }

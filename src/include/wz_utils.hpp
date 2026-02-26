@@ -94,6 +94,7 @@ inline idx_t FindColumnWithAliases(const vector<string> &source_columns, const s
         {"strbeleg2",        {"strBeleg2", "beleg2", "beleg_2", "belegfeld2", "belegfeld_2", "trans_nr", "transnr", "trans_nummer", "transaktionsnr", nullptr}},
         {"strbuchtext",      {"strBuchText", "strbuchtext", "buchungstext", "buchtext", "text", "description", nullptr}},
         {"dtmbelegdatum",    {"dtmBelegDatum", "belegdatum", "datum", "date", nullptr}},
+        {"guiverfahrenid",   {"guiVerfahrenID", "gui_verfahren_id", "guiverfahrenid", "verfahren_id", "verfahrenid", nullptr}},
     };
 
     for (const auto &group : ALIAS_GROUPS) {

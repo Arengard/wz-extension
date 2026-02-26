@@ -199,6 +199,32 @@ Example output with `monatsvorlauf := true` (one Vorlauf per month):
 └──────────────┴───────────────┴──────────────────────────────────────┴──────────────────┴─────────┴───────────────┘
 ```
 
+### `batch_into_wz`
+
+Batch version of `into_wz` that processes multiple `gui_verfahren_id` values from a single source table. Groups rows by their `gui_verfahren_id` column, creates a Vorlauf for each group, and inserts the corresponding Primanota rows within a single all-or-nothing MSSQL transaction.
+
+```sql
+SELECT * FROM batch_into_wz(
+    secret := 'ms',
+    source_table := 'winsolvenz_ready',
+    lng_kanzlei_konten_rahmen_id := 55,
+    str_angelegt := 'rl'
+);
+```
+
+The source table must contain a `gui_verfahren_id` column (accepted names: `guiVerfahrenID`, `gui_verfahren_id`, `guiverfahrenid`, `verfahren_id`, `verfahrenid`).
+
+#### Parameters
+
+Same as `into_wz` except:
+- **No `gui_verfahren_id` parameter** — read from the source data column
+- **No `monatsvorlauf` parameter** — grouping is by `gui_verfahren_id`
+- Uses INSERT-only transfer (no BCP) to maintain all-or-nothing transaction atomicity
+
+#### Transaction Semantics
+
+All groups are processed within a single MSSQL transaction. If any group fails (validation, Vorlauf insert, or Primanota transfer), the entire transaction is rolled back — no partial inserts.
+
 ### `move_to_mssql`
 
 Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target table, then loads data via BCP (with INSERT VALUES fallback).
