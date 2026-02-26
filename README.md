@@ -4,7 +4,7 @@ A DuckDB extension for importing data into WZ (Wirtschaftszahlen) MSSQL tables w
 
 ## Overview
 
-This extension provides three table functions:
+This extension provides four table functions:
 
 ### `into_wz` — WZ Accounting Import
 The `into_wz` function:
@@ -28,6 +28,14 @@ The `move_to_mssql` function:
 - Uses BCP bulk copy for maximum speed, with batched INSERT VALUES as fallback
 - Reports per-table results (rows transferred, method used, duration, errors)
 - Continues on per-table errors and reports failures at the end
+
+### `import_kontobezeichnung` — Import Account Descriptions
+The `import_kontobezeichnung` function:
+- Imports account descriptions from a DuckDB table into MSSQL `tblVerfahrenKontenbezeichnung`
+- Maps `konto` and `kontobezeichnung` columns from the source table
+- Hardcodes sensible defaults for metadata columns (lngTimestamp, lngEAKonto, dtmGueltigAb)
+- Uses transactions for data integrity (all-or-nothing)
+- Batches INSERT statements for performance (1,000 rows per batch)
 
 ### `stps_drop_all` — Clean DuckDB State
 The `stps_drop_all` function:
@@ -396,6 +404,76 @@ SELECT * FROM move_to_mssql(
 └──────────────┴──────────────────┴────────┴──────────┴─────────┴───────────────┘
 ```
 
+### `import_kontobezeichnung`
+
+Imports account descriptions (Kontobezeichnungen) from a DuckDB table into MSSQL `tblVerfahrenKontenbezeichnung`.
+
+#### Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `secret` | VARCHAR | No | `mssql_conn` | Name of the MSSQL connection secret |
+| `source_table` | VARCHAR | **Yes** | - | Name of the DuckDB table containing source data |
+| `gui_verfahren_id` | VARCHAR | **Yes** | - | The VerfahrenID for all rows |
+| `str_angelegt` | VARCHAR | No | `wz` | User who created the records |
+
+#### Source Table Columns
+
+| Column | Aliases | Description |
+|--------|---------|-------------|
+| `konto` | `decKontoNr`, `kontonr`, `konto_nr` | Account number (DECIMAL) |
+| `kontobezeichnung` | `strBezeichnung`, `bezeichnung` | Account description (VARCHAR) |
+
+Rows with NULL `konto` or `kontobezeichnung` are silently skipped.
+
+#### Target Table Mapping
+
+| MSSQL Column | Value |
+|-------------|-------|
+| `lngTimestamp` | `0` |
+| `strAngelegt` | `str_angelegt` parameter |
+| `dtmAngelegt` | Current timestamp |
+| `strGeaendert` | `NULL` |
+| `dtmGeaendert` | `NULL` |
+| `guiVerfahrenID` | `gui_verfahren_id` parameter |
+| `lngEAKonto` | `0` |
+| `dtmGueltigAb` | `1980-01-01 00:00:00` |
+| `decKontoNr` | Source `konto` column |
+| `strBezeichnung` | Source `kontobezeichnung` column |
+
+#### Return Value
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `table_name` | VARCHAR | Always `tblVerfahrenKontenbezeichnung` |
+| `rows_inserted` | BIGINT | Number of rows inserted |
+| `duration` | VARCHAR | Time taken (hh:mm:ss) |
+| `success` | BOOLEAN | Whether the import succeeded |
+| `error_message` | VARCHAR | Error details if failed |
+
+#### Example
+
+```sql
+-- Create source table with account descriptions
+CREATE TABLE kb (konto DECIMAL, kontobezeichnung VARCHAR);
+INSERT INTO kb VALUES (1000, 'Kasse I'), (1200, 'Bank'), (1800, 'Privatentnahmen');
+
+-- Import into MSSQL
+SELECT * FROM import_kontobezeichnung(
+    secret := 'ms',
+    source_table := 'kb',
+    gui_verfahren_id := '37c1255a-8bb7-43f3-bc65-41a5c135f7dd'
+);
+```
+
+```
+┌─────────────────────────────────────┬───────────────┬──────────┬─────────┬───────────────┐
+│ table_name                          │ rows_inserted │ duration │ success │ error_message │
+├─────────────────────────────────────┼───────────────┼──────────┼─────────┼───────────────┤
+│ tblVerfahrenKontenbezeichnung       │ 3             │ 00:00:00 │ true    │               │
+└─────────────────────────────────────┴───────────────┴──────────┴─────────┴───────────────┘
+```
+
 ### `stps_drop_all`
 
 Drops all tables, views, and user-created schemas in DuckDB and detaches all non-default databases. Takes no parameters.
@@ -735,6 +813,7 @@ wz-extension/
 │   ├── into_wz_function.cpp      # into_wz function implementation
 │   ├── move_to_mssql_function.cpp  # move_to_mssql function implementation
 │   ├── stps_drop_all_function.cpp # stps_drop_all function implementation
+│   ├── import_kontobezeichnung_function.cpp # import_kontobezeichnung function
 │   └── constraint_checker.cpp     # FK constraint validation
 ├── duckdb/                       # DuckDB submodule
 ├── extension-ci-tools/           # Build infrastructure

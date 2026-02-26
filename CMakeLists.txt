@@ -19,6 +19,7 @@ set(EXTENSION_SOURCES
     src/constraint_checker.cpp
     src/move_to_mssql_function.cpp
     src/stps_drop_all_function.cpp
+    src/import_kontobezeichnung_function.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

@@ -24,6 +24,7 @@ void WzExtension::Load(ExtensionLoader &loader) {
     RegisterBatchIntoWzFunction(db);
     RegisterMoveToMssqlFunction(db);
     RegisterStpsDropAllFunction(db);
+    RegisterImportKontobezeichnungFunction(db);
 }
 
 std::string WzExtension::Name() {
@@ -46,6 +47,7 @@ DUCKDB_EXTENSION_API void wz_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
     duckdb::RegisterBatchIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
     duckdb::RegisterStpsDropAllFunction(db);
+    duckdb::RegisterImportKontobezeichnungFunction(db);
 }
 
 // Legacy entry point (kept for compatibility)
@@ -55,6 +57,7 @@ DUCKDB_EXTENSION_API void wz_init(duckdb::DatabaseInstance &db) {
     duckdb::RegisterBatchIntoWzFunction(db);
     duckdb::RegisterMoveToMssqlFunction(db);
     duckdb::RegisterStpsDropAllFunction(db);
+    duckdb::RegisterImportKontobezeichnungFunction(db);
 }
 
 DUCKDB_EXTENSION_API const char *wz_version() {
