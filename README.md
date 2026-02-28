@@ -312,7 +312,7 @@ Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target ta
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `secret` | VARCHAR | **Yes** | - | Name of the MSSQL connection secret |
+| `secret` | VARCHAR | No | `mssql_conn` | Name of the MSSQL connection secret |
 | `source` | VARCHAR | No | - | File path to a DuckDB database file to auto-attach as source (overrides `duckdb_catalog`) |
 | `all_tables` | BOOLEAN | No | `true` | Transfer all tables in DuckDB |
 | `tables` | LIST(VARCHAR) | No | `[]` | Explicit list of table names to transfer (sets `all_tables` to false) |
@@ -321,6 +321,7 @@ Bulk-transfers DuckDB tables to MSSQL Server. DROPs and recreates each target ta
 | `mssql_schema` | VARCHAR | No | `dbo` | Alias for `schema` — target schema on MSSQL Server. When not set with `duckdb_schema='all'`, mirrors each DuckDB schema name. |
 | `duckdb_schema` | VARCHAR | No | `main` | Source schema in DuckDB. Use `'all'` to discover and transfer tables from all schemas. |
 | `duckdb_catalog` | VARCHAR | No | `memory` | Source catalog in DuckDB |
+| `mssql_database` | VARCHAR | No | - | Override the target MSSQL database name from the secret. The database is auto-created if it doesn't exist. |
 
 #### Return Value
 
@@ -388,6 +389,12 @@ SELECT * FROM move_to_mssql(
     source='C:\Users\Ramon\Downloads\my_database.db',
     duckdb_schema='main',
     mssql_schema='imported'
+);
+
+-- Transfer to a different MSSQL database (auto-created if it doesn't exist)
+SELECT * FROM move_to_mssql(
+    secret='my_mssql_secret',
+    mssql_database='AnalyticsDB'
 );
 ```
 
