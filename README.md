@@ -41,7 +41,7 @@ The `import_kontobezeichnung` function:
 The `stps_drop_all` function:
 - Drops all views, tables, and user-created schemas in DuckDB
 - Detaches all non-default attached databases
-- Takes no parameters — a "nuke everything" reset function
+- Accepts an optional schema name parameter to limit drops to a single schema (e.g., `stps_drop_all('main')`)
 - Returns a result table showing each dropped/detached object and its status
 
 ## Prerequisites
@@ -483,7 +483,13 @@ SELECT * FROM import_kontobezeichnung(
 
 ### `stps_drop_all`
 
-Drops all tables, views, and user-created schemas in DuckDB and detaches all non-default databases. Takes no parameters.
+Drops all tables, views, and user-created schemas in DuckDB and detaches all non-default databases. Accepts an optional schema name to limit drops to that schema only.
+
+#### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `schema_name` | VARCHAR | No | If provided, only drop views and tables within this schema. If omitted, drop everything. |
 
 #### Return Value
 
@@ -493,11 +499,14 @@ Drops all tables, views, and user-created schemas in DuckDB and detaches all non
 | `object_name` | VARCHAR | Qualified name of the dropped/detached object |
 | `status` | VARCHAR | Result (`DROPPED`, `DETACHED`, or error message) |
 
-#### Example
+#### Examples
 
 ```sql
--- Reset DuckDB to a clean state
+-- Reset DuckDB to a clean state (drop everything)
 SELECT * FROM stps_drop_all();
+
+-- Drop only views and tables in the 'main' schema
+SELECT * FROM stps_drop_all('main');
 ```
 
 ```

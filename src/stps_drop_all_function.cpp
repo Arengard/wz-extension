@@ -1,5 +1,6 @@
 #include "wz_extension.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -23,6 +24,7 @@ struct DropAllResult {
 struct StpsDropAllBindData : public TableFunctionData {
     vector<DropAllResult> results;
     bool executed;
+    string schema_filter; // empty = drop everything, non-empty = drop only within this schema
     StpsDropAllBindData() : executed(false) {}
 };
 
@@ -41,7 +43,11 @@ static unique_ptr<FunctionData> StpsDropAllBind(ClientContext &context,
                                                  vector<string> &names) {
     names = {"object_type", "object_name", "status"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
-    return make_uniq<StpsDropAllBindData>();
+    auto bind_data = make_uniq<StpsDropAllBindData>();
+    if (!input.inputs.empty()) {
+        bind_data->schema_filter = input.inputs[0].GetValue<string>();
+    }
+    return std::move(bind_data);
 }
 
 // ============================================================================
@@ -67,12 +73,19 @@ static void StpsDropAllExecute(ClientContext &context, TableFunctionInput &data_
         auto &db = DatabaseInstance::GetDatabase(context);
         Connection conn(db);
 
-        // Step 1: Drop all views
+        bool filter_schema = !bind_data.schema_filter.empty();
+        string schema_condition;
+        if (filter_schema) {
+            schema_condition = " AND table_schema = '" + bind_data.schema_filter + "'";
+        }
+
+        // Step 1: Drop all views (filtered by schema if specified)
         {
-            auto result = conn.Query(
-                "SELECT table_schema, table_name FROM information_schema.tables "
-                "WHERE table_type = 'VIEW' "
-                "AND table_schema NOT IN ('information_schema', 'pg_catalog')");
+            string query = "SELECT table_schema, table_name FROM information_schema.tables "
+                           "WHERE table_type = 'VIEW' "
+                           "AND table_schema NOT IN ('information_schema', 'pg_catalog')";
+            if (filter_schema) { query += schema_condition; }
+            auto result = conn.Query(query);
             if (!result->HasError()) {
                 for (auto &chunk : result->Collection().Chunks()) {
                     for (idx_t row = 0; row < chunk.size(); row++) {
@@ -93,12 +106,13 @@ static void StpsDropAllExecute(ClientContext &context, TableFunctionInput &data_
             }
         }
 
-        // Step 2: Drop all tables
+        // Step 2: Drop all tables (filtered by schema if specified)
         {
-            auto result = conn.Query(
-                "SELECT table_schema, table_name FROM information_schema.tables "
-                "WHERE table_type = 'BASE TABLE' "
-                "AND table_schema NOT IN ('information_schema', 'pg_catalog')");
+            string query = "SELECT table_schema, table_name FROM information_schema.tables "
+                           "WHERE table_type = 'BASE TABLE' "
+                           "AND table_schema NOT IN ('information_schema', 'pg_catalog')";
+            if (filter_schema) { query += schema_condition; }
+            auto result = conn.Query(query);
             if (!result->HasError()) {
                 for (auto &chunk : result->Collection().Chunks()) {
                     for (idx_t row = 0; row < chunk.size(); row++) {
@@ -119,8 +133,8 @@ static void StpsDropAllExecute(ClientContext &context, TableFunctionInput &data_
             }
         }
 
-        // Step 3: Drop all non-default schemas
-        {
+        // Step 3: Drop all non-default schemas (only when no schema filter)
+        if (!filter_schema) {
             auto result = conn.Query(
                 "SELECT schema_name FROM information_schema.schemata "
                 "WHERE schema_name NOT IN ('main', 'information_schema', 'pg_catalog')");
@@ -142,8 +156,8 @@ static void StpsDropAllExecute(ClientContext &context, TableFunctionInput &data_
             }
         }
 
-        // Step 4: Detach all non-default databases
-        {
+        // Step 4: Detach all non-default databases (only when no schema filter)
+        if (!filter_schema) {
             auto result = conn.Query(
                 "SELECT database_name FROM duckdb_databases() "
                 "WHERE internal = false AND NOT is_default");
@@ -193,12 +207,18 @@ static void StpsDropAllExecute(ClientContext &context, TableFunctionInput &data_
 // ============================================================================
 
 void RegisterStpsDropAllFunction(DatabaseInstance &db) {
-    TableFunction func("stps_drop_all", {}, StpsDropAllExecute, StpsDropAllBind, StpsDropAllInitGlobal);
+    TableFunctionSet func_set("stps_drop_all");
+    // stps_drop_all() — no arguments, drops everything
+    TableFunction no_args("stps_drop_all", {}, StpsDropAllExecute, StpsDropAllBind, StpsDropAllInitGlobal);
+    func_set.AddFunction(no_args);
+    // stps_drop_all('schema_name') — drops only views/tables in the specified schema
+    TableFunction with_schema("stps_drop_all", {LogicalType::VARCHAR}, StpsDropAllExecute, StpsDropAllBind, StpsDropAllInitGlobal);
+    func_set.AddFunction(with_schema);
 
     Connection con(db);
     con.BeginTransaction();
     auto &catalog = Catalog::GetSystemCatalog(db);
-    CreateTableFunctionInfo info(func);
+    CreateTableFunctionInfo info(func_set);
     catalog.CreateFunction(*con.context, info);
     con.Commit();
 }
