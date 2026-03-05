@@ -28,6 +28,20 @@ actionlint
 # CodeQL
 _codeql_detected_source_root
 
+# Node.js
+node_modules/
+package.json
+package-lock.json
+
+# Test artifacts
+test_*.db
+test_*.tsv
+test_*.sql
+stderr*.txt
+
+# Distribution
+dist/
+
 # Git worktrees
 .worktrees/
 .claude/
